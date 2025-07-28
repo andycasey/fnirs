@@ -9,4 +9,6 @@ dependencies = [
     "matplotlib>=3.10.3",
     "ipython>=9.4.0",
     "astropy>=7.1.0",
+    "pywavelets>=1.8.0",
+    "statsmodels>=0.14.5",
 ]

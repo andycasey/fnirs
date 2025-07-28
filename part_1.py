@@ -8,6 +8,7 @@ from fnirs.remove_autocorrelation_dc import remove_autocorrelation_dc, remove_au
 from fnirs.compute_correlation_coefficient import compute_correlation_coefficient
 from fnirs.plot_seed_based_sphere_style import plot_seed_based_sphere_style
 from fnirs.plot_correlation_matrices import plot_correlation_matrix
+from fnirs.hybrid_motion_correction import hybrid_motion_correction
 
 # Load data from one participant
 data = loadmat('rsFC-fnirs-course/Data_for_Part_I.mat')['data']
@@ -211,6 +212,8 @@ bad_channels = mark_bad_channels(d, sd)
 
 # Compute Optical Density
 dod = hmr_intensity_2_od(d)
+
+dod = hybrid_motion_correction(dod, sd)
 
 
 # Compute Hemoglobin Concentration changes

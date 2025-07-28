@@ -38,13 +38,14 @@ def hmr_od_2_conc(dod, sd, ppf):
 
     lst = np.where(ml[:, 3] == 1)[0]
     dc = np.zeros((n_t_pts, 3, len(lst)))
-
+    rhos = np.zeros(len(lst))
     for idx, idx1 in enumerate(lst):
-        idx2 = np.where((ml[:, 3] > 1) & (ml[:, 0] == ml[idx1, 0]) & (ml[:, 1] == ml[idx1, 2]))[0]
+        idx2 = np.where((ml[:, 3] > 1) & (ml[:, 0] == ml[idx1, 0]) & (ml[:, 1] == ml[idx1, 1]))[0]
         rho = np.linalg.norm(sd['SrcPos'][ml[idx1, 0] - 1, :] - sd['DetPos'][ml[idx1, 1] - 1, :])
         dc[:, :2, idx] = (einv @ (dod[:, np.concatenate(([idx1], idx2))] / (np.ones((n_t_pts, 1)) * rho * np.array(ppf))).T).T
+        rhos[idx] = rho
 
     # dc index 1 is hbo, hbr, hbt
     # hbt = hbo + hbr
     dc[:, 2, :] = dc[:, 0, :] + dc[:, 1, :]
-    return dc
+    return dc #, rhos

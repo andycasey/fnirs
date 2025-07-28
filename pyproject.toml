@@ -11,4 +11,7 @@ dependencies = [
     "astropy>=7.1.0",
     "pywavelets>=1.8.0",
     "statsmodels>=0.14.5",
+    "optax>=0.2.5",
+    "flax>=0.10.4",
+    "tinygp>=0.3.0",
 ]

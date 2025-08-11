@@ -23,13 +23,13 @@ def physiology_regression_glm(dc, sd, ss_list_good, additional_regressors):
 
     filtered_dc = np.zeros_like(dc)
     stats = {}
-
+    len_x = 0
     for hb in range(2):
         for n_chan in range(dc.shape[1]):
             y = dc[:, n_chan, hb]
             x = np.array([]).reshape(len(y), 0)
 
-            if ss_list_good:
+            if ss_list_good is not None:
                 x_short = np.concatenate([dc[:, ss_list_good, 0], dc[:, ss_list_good, 1]], axis=1)
                 # PCA for removing collinearity
                 from sklearn.decomposition import PCA
@@ -45,11 +45,12 @@ def physiology_regression_glm(dc, sd, ss_list_good, additional_regressors):
                     x = x[max_lag:-max_lag, :]
 
                 x = np.concatenate([x, additional_regressors_s], axis=1)
+                len_x = len(x)
 
             rlm_model = sm.RLM(y, x, M=sm.robust.norms.TukeyBiweight())
             rlm_results = rlm_model.fit()
 
-            filtered_dc[:, n_chan, hb] = rlm_results.resid
+            filtered_dc[:len(x), n_chan, hb] = rlm_results.resid
 
             stats_dummy = {
                 'resid': rlm_results.resid,
@@ -68,4 +69,4 @@ def physiology_regression_glm(dc, sd, ss_list_good, additional_regressors):
 
     filtered_dc[:, :, 2] = filtered_dc[:, :, 0] + filtered_dc[:, :, 1]
 
-    return filtered_dc, stats
+    return filtered_dc[:len_x], stats

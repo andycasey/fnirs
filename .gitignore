@@ -1,0 +1,9 @@
+.DS_Store
+.gitignore
+__pycache__
+20250714-for-adacs/
+rsFC-fnirs-course/
+uv.lock
+*.npz
+
+*.snirf # don't accidentally add proprietary info

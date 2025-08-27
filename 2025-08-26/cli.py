@@ -17,7 +17,7 @@ def fit(
     sph: Annotated[int, typer.Option(help="Maximum spherical harmonic degree")] = 4,
     f: Annotated[int, typer.Option(help="Number of Fourier components")] = None,
     elevation: Annotated[float, typer.Option(help="Elevation angle for 3D view")] = 10.0,
-    azimuth: Annotated[float, typer.Option(help="Azimuth angle for 3D view")] = 225.0,
+    azimuth: Annotated[float, typer.Option(help="Azimuth angle for 3D view")] = 135.0,
 ):
     """Fit a model to a processed SNIRF data set."""
 
@@ -103,6 +103,14 @@ def fit(
     ax_channels.set_xlabel("Time [s]")
     ax_channels.set_yticks([])
     
+    for stimulus in data.stimulus:
+        for onset, duration in zip(stimulus.onsets, stimulus.durations):
+            ax_channels.axvspan(
+                onset, 
+                onset + duration, 
+                color='#666666', 
+                alpha=0.3
+            )
 
     for ax in (ax_data, ax_model):
         ax.set_xlabel("x")
@@ -124,6 +132,7 @@ def fit(
     for i in range(Y.shape[0]):
         bias = np.mean(Y[i])
         scale = np.ptp(Y[i])
+        bias, scale = 0, 1
         ax_channels.plot(t, (Y[i] - bias)/scale + i, c='k', alpha=0.5)
         ax_channels.plot(t, (Y_predicted[i] - bias)/scale + i, c='tab:green', alpha=0.5)
     

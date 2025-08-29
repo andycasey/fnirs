@@ -24,7 +24,7 @@ def fit(
     from time import time
     import numpy as np
     import jax.numpy as jnp
-    from spherical_projection import project_fnirs_to_sphere, cartesian_to_spherical
+    from spherical_projection import project_fnirs_to_sphere, cartesian_to_spherical, project_to_sphere
     from snirf import load_snirf_data
     from model import fit, create_spherical_harmonics_basis
     from sklearn.metrics import r2_score
@@ -42,8 +42,25 @@ def fit(
     coords_3d = data.get_spatial_coordinates_3d()[indices]
     Y = data.time_series.T[indices]
 
+    #coords_3d[:, 2] *= -1
+
     sphere_result = project_fnirs_to_sphere(coords_3d, fit_method='least_squares')
     θ, ϕ = jnp.array(sphere_result['theta']), jnp.array(sphere_result['phi'])
+    #coords_3d[:, 2] *= -1
+
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax2 = fig.add_subplot(122, projection='3d')
+    scat1 = ax1.scatter(coords_3d[:, 0], coords_3d[:, 1], coords_3d[:, 2], c=θ)
+    plt.colorbar(scat1)
+
+    scat2 = ax2.scatter(coords_3d[:, 0], coords_3d[:, 1], coords_3d[:, 2], c=ϕ)
+    plt.colorbar(scat2)
+    plt.show()
+
+
+
 
     t = jnp.array(data.time)
     f = f or len(t)
@@ -51,7 +68,7 @@ def fit(
     Y = jnp.array(Y)
 
     t_solve = -time()
-    X, f, A, ST, terms = fit(t, θ, ϕ, Y, sph, f or len(t))
+    X, f, A, ST, terms = fit(t, θ, ϕ, Y, sph, f or len(t) // 2 + 1)
     t_solve += time()
     print(f"Solve time: {t_solve:.2f} s")
 
@@ -66,7 +83,18 @@ def fit(
     #fine_points, mesh = refiner.method_pymeshlab_refinement() # not bad
     #fine_points, mesh = refiner.method_trimesh_refinement()
     fine_points, mesh = refiner.method_open3d_ball_pivoting()
-    r, theta, phi = cartesian_to_spherical(fine_points, center=sphere_result["sphere_center"])
+
+    # compute at same rotation
+    fine_projected_pos, _, _ = project_to_sphere(fine_points, 
+                                          center=sphere_result["sphere_center"], 
+                                          radius=sphere_result["sphere_radius"],
+                                          method="radial")    
+
+    centered_pos = fine_projected_pos - sphere_result["sphere_center"]
+    rotated_centered_pos = centered_pos @ sphere_result["rotation_matrix"].T
+    fine_rotated_projected_pos = rotated_centered_pos + sphere_result["sphere_center"]
+
+    r, theta, phi = cartesian_to_spherical(fine_rotated_projected_pos, center=sphere_result["sphere_center"])
 
     SiT, terms = create_spherical_harmonics_basis(
         theta, 
@@ -128,6 +156,9 @@ def fit(
             **kwargs
         )
     
+    #scatter_3d(ax_model, fine_points, phi)
+
+
     # Plot all the channels
     for i in range(Y.shape[0]):
         bias = np.mean(Y[i])

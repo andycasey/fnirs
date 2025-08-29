@@ -218,10 +218,109 @@ def fit_sphere_to_head(positions_3d: np.ndarray,
     return center, radius
 
 
+def _compute_optimal_rotation(projected_positions: np.ndarray, center: np.ndarray) -> np.ndarray:
+    """
+    Compute optimal rotation matrix to place poles and phi boundaries away from data positions.
+    
+    For fNIRS data on human skulls, we want to rotate the coordinate system so that:
+    1. The poles (theta=0, theta=π) are in regions with no data
+    2. The phi boundary (phi=0/2π) is in a region with no data
+    
+    Strategy:
+    - Find the centroid of the data positions on the sphere
+    - Rotate so this centroid is at theta=π/2, phi=π (opposite of typical "front")
+    - This places poles at unused regions and phi boundary away from dense data
+    
+    Parameters
+    ----------
+    projected_positions : np.ndarray
+        Positions projected onto sphere surface
+    center : np.ndarray
+        Center of the sphere
+        
+    Returns
+    -------
+    rotation_matrix : np.ndarray
+        3x3 rotation matrix to apply to coordinates
+    """
+    # Center the positions
+    centered_positions = projected_positions - center
+    
+    # Find the centroid direction of the data on the sphere
+    # This represents the "center" of where the data is located
+    data_centroid = np.mean(centered_positions, axis=0)
+    data_centroid = data_centroid / np.linalg.norm(data_centroid)
+    
+    # We want to rotate so that:
+    # 1. data_centroid -> direction (0, -1, 0) which corresponds to theta=π/2, phi=3π/2
+    # This puts the north pole (theta=0) and south pole (theta=π) away from data
+    # And puts phi=0 boundary away from the main data region
+    
+    target_direction = np.array([0.0, -1.0, 0.0])
+    
+    # Compute rotation matrix to align data_centroid with target_direction
+    # Using Rodrigues' rotation formula
+    v = np.cross(data_centroid, target_direction)
+    s = np.linalg.norm(v)
+    c = np.dot(data_centroid, target_direction)
+    
+    if s < 1e-10:  # Vectors are already aligned or opposite
+        if c > 0:  # Same direction
+            rotation_matrix = np.eye(3)
+        else:  # Opposite direction - rotate 180° around any perpendicular axis
+            # Find a perpendicular axis
+            if abs(data_centroid[0]) < 0.9:
+                perp = np.array([1.0, 0.0, 0.0])
+            else:
+                perp = np.array([0.0, 1.0, 0.0])
+            perp = perp - np.dot(perp, data_centroid) * data_centroid
+            perp = perp / np.linalg.norm(perp)
+            # 180° rotation around perpendicular axis
+            rotation_matrix = 2 * np.outer(perp, perp) - np.eye(3)
+    else:
+        # General case - use Rodrigues' formula
+        vx = np.array([[0, -v[2], v[1]],
+                       [v[2], 0, -v[0]],
+                       [-v[1], v[0], 0]])
+        rotation_matrix = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+    
+    return rotation_matrix
+
+
+def inverse_rotation_transform(positions: np.ndarray, 
+                              rotation_matrix: np.ndarray, 
+                              center: np.ndarray) -> np.ndarray:
+    """
+    Apply inverse rotation to transform positions back to original coordinate system.
+    
+    Parameters
+    ----------
+    positions : np.ndarray
+        Positions in rotated coordinate system
+    rotation_matrix : np.ndarray
+        Original rotation matrix (3x3)
+    center : np.ndarray
+        Sphere center
+        
+    Returns
+    -------
+    original_positions : np.ndarray
+        Positions in original coordinate system
+    """
+    if rotation_matrix is None:
+        return positions
+    
+    # Apply inverse rotation (transpose of rotation matrix)
+    centered_pos = positions - center
+    original_centered_pos = centered_pos @ rotation_matrix  # Inverse is transpose
+    original_positions = original_centered_pos + center
+    
+    return original_positions
 
 def project_fnirs_to_sphere(positions_3d: np.ndarray,
                            fit_method: str = 'least_squares',
-                           projection_method: str = 'radial') -> dict:
+                           projection_method: str = 'radial',
+                           rotate_poles: bool = True) -> dict:
     """
     Complete pipeline to project fNIRS positions onto sphere and convert to spherical coordinates.
     
@@ -233,6 +332,9 @@ def project_fnirs_to_sphere(positions_3d: np.ndarray,
         Method to fit sphere ('centroid' or 'least_squares')
     projection_method : str
         Method to project onto sphere ('radial')
+    rotate_poles : bool
+        If True, rotate coordinate system to place poles and phi boundaries 
+        away from data positions to avoid singularities
         
     Returns
     -------
@@ -245,6 +347,7 @@ def project_fnirs_to_sphere(positions_3d: np.ndarray,
         - 'phi': Azimuthal angles (longitude) [0, 2π]
         - 'original_positions': Original input positions
         - 'projection_errors': Distance from original to projected positions
+        - 'rotation_matrix': Rotation matrix applied (if rotate_poles=True)
     """
     positions_3d = np.array(positions_3d)
     
@@ -257,8 +360,19 @@ def project_fnirs_to_sphere(positions_3d: np.ndarray,
                                           radius=radius,
                                           method=projection_method)
     
+    # Determine optimal rotation to avoid poles/boundaries at data positions
+    rotation_matrix = None
+    rotated_projected_pos = projected_pos
+    
+    if rotate_poles:
+        rotation_matrix = _compute_optimal_rotation(projected_pos, center)
+        # Apply rotation to projected positions (centered at sphere center)
+        centered_pos = projected_pos - center
+        rotated_centered_pos = centered_pos @ rotation_matrix.T
+        rotated_projected_pos = rotated_centered_pos + center
+    
     # Convert to spherical coordinates
-    r, theta, phi = cartesian_to_spherical(projected_pos, center=center)
+    r, theta, phi = cartesian_to_spherical(rotated_projected_pos, center=center)
     
     # Calculate projection errors
     projection_errors = np.linalg.norm(positions_3d - projected_pos, axis=1)
@@ -266,14 +380,16 @@ def project_fnirs_to_sphere(positions_3d: np.ndarray,
     result = {
         'sphere_center': center,
         'sphere_radius': radius,
-        'projected_positions': projected_pos,
+        'projected_positions': rotated_projected_pos,
         'theta': theta,
         'phi': phi,
         'r': r,  # Should be constant = radius
         'original_positions': positions_3d,
         'projection_errors': projection_errors,
         'fit_method': fit_method,
-        'projection_method': projection_method
+        'projection_method': projection_method,
+        'rotation_matrix': rotation_matrix,
+        'unrotated_projected_positions': projected_pos
     }
     
     return result
@@ -366,5 +482,10 @@ def visualize_spherical_projection(result: dict,
     print(f"  Mean projection error: {np.mean(result['projection_errors']):.3f} cm")
     print(f"  Theta range: {theta.min():.3f} to {theta.max():.3f} radians")
     print(f"  Phi range: {phi.min():.3f} to {phi.max():.3f} radians")
+    
+    if result['rotation_matrix'] is not None:
+        print(f"  Coordinate system rotated to avoid poles/boundaries at data positions")
+    else:
+        print(f"  Using standard coordinate system (no rotation applied)")
 
 

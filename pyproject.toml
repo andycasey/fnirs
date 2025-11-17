@@ -1,8 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
 [project]
 name = "fnirs"
 version = "0.1.0"
-description = "Add your description here"
+description = "A brief description of your package"
 readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Andy Casey", email = "andycasey@gmail.com"}
+]
+maintainers = [
+    {name = "Andy Casey", email = "andycasey@gmail.com"}
+]
+keywords = ["keyword1", "keyword2", "keyword3"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
 requires-python = ">=3.12"
 dependencies = [
     "jax==0.4.38",
@@ -17,4 +39,36 @@ dependencies = [
     "scikit-learn>=1.7.1",
     "typer>=0.16.1",
     "h5py>=3.14.0",
+    "marimo>=0.15.3",
+    "pyarrow>=21.0.0",
+    "scipy>=1.11.0",
 ]
+
+
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "flake8>=3.8",
+    "mypy>=0.900",
+    "ipython"
+]
+docs = [
+    "sphinx>=4.0",
+    "sphinx-rtd-theme>=1.0"
+]
+mesh = [
+    "open3d>=0.18.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["fnirs*"]
+
+[tool.uv]
+constraint-dependencies = ["llvm>0.43.0"]
+
+
+

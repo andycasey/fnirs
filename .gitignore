@@ -1,9 +1,62 @@
+# macOS
 .DS_Store
-.gitignore
-__pycache__
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter & Marimo
+.ipynb_checkpoints/
+__marimo__/
+
+# Data files (don't commit large data or proprietary info)
+*.snirf
+*.npz
+*.mat
 20250714-for-adacs/
 rsFC-fnirs-course/
-uv.lock
-*.npz
+data/
 
-*.snirf # don't accidentally add proprietary info
+# Package managers
+uv.lock
+
+# Large visualization files (keep only small ones for README)
+figures/spherical_harmonics_demo.gif
+figures/spherical_harmonics_demo_small.gif
+figures/dc/
+figures/motion/
+
+# Test files
+.pytest_cache/
+.coverage
+htmlcov/

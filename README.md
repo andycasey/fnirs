@@ -124,6 +124,20 @@ The animation below demonstrates how the model works: spatial patterns (spherica
 - **Bottom plot**: Temporal coefficients (colored lines) and their sum (black line)
 - As time progresses, each sphere's opacity changes to show its contribution
 
+### Why This Approach?
+
+In fNIRS, we are measuring samples of an underlying latent field: the hemoglobin concentration beneath the skull. However, we can only measure at discrete channel positions determined by our source-detector pairs—we cannot sample everywhere we might want. Additionally, all measurements are corrupted by noise from various sources (physiological, instrumental, motion artifacts, etc.).
+
+Traditional fNIRS analysis often treats each channel independently, computing statistics per channel and then comparing correlation coefficients between signals in different channels. This approach has limitations: it ignores the spatial structure of the hemodynamic response, treats noisy measurements as ground truth, and doesn't leverage the fact that nearby channels are measuring the same underlying continuous field.
+
+Instead, this package takes a different approach: we fit all the data simultaneously to learn the underlying hemoglobin concentration field everywhere beneath the skull. By modeling the spatial-temporal structure with basis functions (spherical harmonics for space, Fourier components for time), we can:
+- Pool information across all channels to better estimate the true underlying field
+- Denoise measurements by fitting smooth spatial-temporal patterns
+- Interpolate and extrapolate to regions between measurement points
+- Obtain a coherent representation of the entire hemodynamic response
+
+This unified spatial-temporal modeling approach provides a more principled and powerful framework for analyzing fNIRS data than traditional channel-by-channel methods.
+
 ## Examples
 
 ### Notebooks

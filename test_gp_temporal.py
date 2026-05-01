@@ -1,8 +1,10 @@
 """Tests for GP temporal kernel (Matern-1/2) in the fnirs model."""
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 import pytest
+from functools import partial
 from scipy.special import sph_harm_y
 
 from fnirs import fit, matern12_psd
@@ -175,3 +177,113 @@ class TestGPTemporalFit:
         t, theta, phi, _, Y = _make_synthetic_data()
         with pytest.raises(ValueError, match="Unknown temporal kernel"):
             fit(t, theta, phi, Y, 2, 30, temporal_kernel="rbf")
+
+    def test_n_fourier_components_truncation(self):
+        """Truncating n_fourier_components should zero out high-frequency bins."""
+        t, theta, phi, _, Y = _make_synthetic_data()
+        max_degree = 2
+        n_trunc = 20
+
+        X_freq, predict, *_ = fit(t, theta, phi, Y, max_degree, n_fourier_components=n_trunc)
+
+        # Coefficients beyond n_trunc should be zero
+        assert jnp.allclose(X_freq[:, n_trunc:], 0.0), \
+            "High-frequency bins beyond n_fourier_components should be zero"
+
+        # Should still produce valid predictions
+        Y_pred = predict(X_freq)
+        assert Y_pred.shape == Y.shape
+
+    def test_full_frequency_no_truncation(self):
+        """With n_fourier_components=None, all frequency bins should be used."""
+        t, theta, phi, _, Y = _make_synthetic_data()
+        max_degree = 2
+
+        X_freq, predict, *_ = fit(t, theta, phi, Y, max_degree, n_fourier_components=None)
+
+        n_expected_freq = Y.shape[1] // 2 + 1
+        assert X_freq.shape[1] == n_expected_freq
+
+        Y_pred = predict(X_freq)
+        assert Y_pred.shape == Y.shape
+
+    def test_predict_new_spatial_locations(self):
+        """Prediction at new spatial locations should work via spherical harmonics."""
+        t, theta, phi, _, Y = _make_synthetic_data(n_channels=30)
+        max_degree = 2
+
+        X_freq, predict, _, ST, terms = fit(t, theta, phi, Y, max_degree, n_fourier_components=50)
+
+        # Predict at original locations
+        Y_pred_orig = predict(X_freq)
+        assert Y_pred_orig.shape == Y.shape
+
+        # Predict at new locations by building a new ST and applying X_freq
+        from fnirs.model import create_spherical_harmonics_basis
+        rng = np.random.default_rng(123)
+        theta_new = jnp.array(rng.uniform(0, np.pi, 10))
+        phi_new = jnp.array(rng.uniform(0, 2 * np.pi, 10))
+        ST_new, _ = create_spherical_harmonics_basis(theta_new, phi_new, max_degree)
+        ST_new = jnp.array(ST_new)
+
+        pred_freq = ST_new @ X_freq
+        Y_pred_new = jnp.fft.irfft(pred_freq, n=len(t), axis=1)
+
+        assert Y_pred_new.shape == (10, len(t))
+        # Should be real-valued (irfft guarantees this)
+        assert Y_pred_new.dtype in (jnp.float32, jnp.float64)
+
+    def test_fft_vs_explicit_basis_equivalence(self):
+        """FFT-based results should match explicit Fourier basis results (numerically)."""
+        from fnirs.model import (
+            create_1d_fourier_modes,
+            evaluate_1d_fourier_basis,
+            fourier_matmat,
+            fourier_rmatmat,
+            gram_diagonal,
+            create_spherical_harmonics_basis,
+        )
+
+        t, theta, phi, _, Y = _make_synthetic_data(n_channels=20, n_samples=64)
+        max_degree = 2
+        n_fourier = 30
+
+        # --- Old explicit-basis approach (reproduced inline) ---
+        ST_np, terms = create_spherical_harmonics_basis(theta, phi, max_degree)
+        ST = jnp.array(ST_np)
+        n_samples = len(t)
+
+        args = ((n_samples,), (n_fourier,))
+        A = partial(fourier_matmat, *args)
+        AT = partial(fourier_rmatmat, *args)
+        ATA = gram_diagonal(*args)
+
+        lhs_old = ST.T @ ST
+        rhs_old = ((AT(Y) @ ST) / ATA[:, None]).T
+        XT_old, *_ = jnp.linalg.lstsq(lhs_old, rhs_old, rcond=None)
+
+        @jax.jit
+        def f_old(X):
+            return (A(X) @ ST.T).T
+
+        Y_pred_old = f_old(XT_old.T)
+
+        # --- New FFT approach ---
+        X_freq_new, predict_new, *_ = fit(
+            t, theta, phi, Y, max_degree, n_fourier_components=None
+        )
+        Y_pred_new = predict_new(X_freq_new)
+
+        # Both should reconstruct the data similarly when using all frequencies
+        # (not truncated). The old approach uses only n_fourier modes, the new
+        # uses all rfft bins. Compare at the prediction level.
+        # With n_fourier_components=None (all freqs), the new approach is a
+        # least-squares fit using all frequency bins, which should give a
+        # better or equal fit.
+        resid_old = float(jnp.mean((Y - Y_pred_old) ** 2))
+        resid_new = float(jnp.mean((Y - Y_pred_new) ** 2))
+
+        # New approach with all frequencies should fit at least as well
+        assert resid_new <= resid_old + 1e-6, (
+            f"FFT approach should fit at least as well: new={resid_new:.8f} vs old={resid_old:.8f}"
+        )

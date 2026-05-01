@@ -25,20 +25,57 @@ def matern12_psd(freqs: jnp.ndarray, lengthscale: float, variance: float) -> jnp
     return 2 * variance * lengthscale / (1 + (lengthscale * omega) ** 2)
 
 
-#@partial(jax.jit, static_argnames=("max_spherical_degree", "n_fourier_components"))
 def fit(
     t: jnp.array,
     θ: jnp.array,
     ϕ: jnp.array,
     Y: jnp.ndarray,
     max_spherical_degree: int,
-    n_fourier_components: int,
+    n_fourier_components: Optional[int] = None,
     temporal_kernel: Optional[str] = None,
     kernel_lengthscale: float = 1.0,
     kernel_variance: float = 1.0,
 ):
+    """
+    Fit a separable spatial-temporal model using FFT for the temporal dimension.
+
+    The model is: Y = ST @ X_spatial_temporal, where ST is the spherical harmonics
+    basis and the temporal structure is handled via FFT (replacing the old explicit
+    Fourier basis evaluation).
+
+    For each frequency bin k, we solve:
+        (ST.T @ ST + lambda_k * I) @ x_k = ST.T @ Y_freq[:, k]
+
+    where lambda_k = 0 when temporal_kernel is None, or 1/S(f_k) for Matern-1/2.
+
+    Note for future IRLS integration: when per-channel weights w are available,
+    scale ST and Y_freq rows by sqrt(w) before forming the normal equations.
+
+    Args:
+        t: time points, shape (n_timepoints,), assumed evenly sampled
+        theta: polar angles of channels, shape (n_channels,)
+        phi: azimuthal angles of channels, shape (n_channels,)
+        Y: data matrix, shape (n_channels, n_timepoints)
+        max_spherical_degree: maximum degree for spherical harmonics basis
+        n_fourier_components: if given, truncate to this many lowest frequency
+            bins (zero out higher frequencies). If None, use all frequency bins.
+        temporal_kernel: None for unregularized, "matern12" for Matern-1/2 GP
+        kernel_lengthscale: lengthscale for the temporal kernel
+        kernel_variance: variance for the temporal kernel
+
+    Returns:
+        Tuple of (X_freq, predict_fn, None, ST, terms) where:
+        - X_freq: complex coefficients, shape (n_spatial, n_freq_bins)
+        - predict_fn: function(X_freq) -> Y_pred, shape (n_channels, n_timepoints)
+        - None: placeholder (was the A operator in old interface)
+        - ST: spherical harmonics basis matrix
+        - terms: list of (degree, order) tuples
+    """
     assert Y.shape[1] == len(t), "Y must have shape (n_channels, n_samples)"
     assert Y.shape[0] == len(θ) == len(ϕ), "Y must have shape (n_channels, n_samples)"
+
+    n_channels, n_timepoints = Y.shape
+
     ST, terms = create_spherical_harmonics_basis(
         θ, ϕ, max_degree=max_spherical_degree
     )
@@ -47,49 +84,63 @@ def fit(
             f"Warning: number of spherical harmonics basis functions ({len(terms)}) exceeds number of channels ({len(θ)})."
         )
 
-    args = ((len(t), ), (n_fourier_components, ))
-    A = partial(fourier_matmat, *args)
-    AT = partial(fourier_rmatmat, *args)
+    ST = jnp.array(ST)
 
-    ATA = gram_diagonal(*args)
-    lhs = ST.T @ ST
-    rhs = ((AT(Y) @ ST) / ATA[:, None]).T
+    # FFT along time axis
+    Y_freq = jnp.fft.rfft(Y, axis=1)  # (n_channels, n_freq_bins)
+    n_freq_all = Y_freq.shape[1]
 
+    # Determine how many frequency bins to use
+    if n_fourier_components is not None:
+        n_freq = min(n_fourier_components, n_freq_all)
+    else:
+        n_freq = n_freq_all
+
+    # Truncate to n_freq lowest frequency bins
+    Y_freq_trunc = Y_freq[:, :n_freq]
+
+    # Frequency array in Hz
+    dt = t[1] - t[0]
+    freqs = jnp.fft.rfftfreq(n_timepoints, d=dt)[:n_freq]
+
+    # Spatial normal equations: ST.T @ ST
+    lhs_base = ST.T @ ST  # (n_spatial, n_spatial)
+    n_spatial = lhs_base.shape[0]
+    eye = jnp.eye(n_spatial)
+
+    # Right-hand side: ST.T @ Y_freq_trunc -> (n_spatial, n_freq)
+    rhs = ST.T @ Y_freq_trunc  # complex
+
+    # Compute per-frequency regularization
     if temporal_kernel is None:
-        XT, *_ = jnp.linalg.lstsq(lhs, rhs, rcond=None)
+        lambdas = jnp.zeros(n_freq)
     elif temporal_kernel == "matern12":
-        # Compute frequencies for each Fourier mode.
-        # Modes have integer frequency indices; the actual frequency in cycles
-        # per time unit depends on the sampling: the basis spans [0, 2π) over
-        # n_samples points, so mode index k completes k cycles in n_samples.
-        # With sampling interval dt = (t[-1] - t[0]) / (n_samples - 1), the
-        # total duration T ≈ n_samples * dt, giving f_k = k / T.
-        n_samples = len(t)
-        modes = create_1d_fourier_modes(n_samples, n_fourier_components)
-        mode_indices = modes[:, 0]  # integer frequency indices
-
-        dt = (t[-1] - t[0]) / (n_samples - 1)
-        duration = n_samples * dt
-        freqs = mode_indices / duration  # cycles per time unit
-
         psd = matern12_psd(freqs, kernel_lengthscale, kernel_variance)
-        lambdas = 1.0 / psd  # regularization per Fourier mode
-
-        n_spatial = lhs.shape[0]
-        eye = jnp.eye(n_spatial)
-
-        # Solve per Fourier mode: (lhs + λ_k I) x_k = rhs_k
-        def solve_one(k):
-            return jnp.linalg.solve(lhs + lambdas[k] * eye, rhs[:, k])
-
-        XT = jax.vmap(solve_one)(jnp.arange(n_fourier_components)).T
+        lambdas = 1.0 / psd
     else:
         raise ValueError(f"Unknown temporal kernel: {temporal_kernel!r}")
 
+    # Solve per frequency bin: (lhs_base + lambda_k * I) @ x_k = rhs_k
+    def solve_one(rhs_k, lambda_k):
+        return jnp.linalg.solve(lhs_base + lambda_k * eye, rhs_k)
+
+    X_freq = jax.vmap(solve_one, in_axes=(1, 0), out_axes=1)(rhs, lambdas)
+    # X_freq is (n_spatial, n_freq) -- complex
+
+    # Pad back to full frequency range if truncated
+    if n_freq < n_freq_all:
+        X_freq_full = jnp.zeros((n_spatial, n_freq_all), dtype=X_freq.dtype)
+        X_freq_full = X_freq_full.at[:, :n_freq].set(X_freq)
+    else:
+        X_freq_full = X_freq
+
+    # Prediction function: takes X_freq_full and returns Y_pred
     @jax.jit
-    def f(X):
-        return (A(X) @ ST.T).T
-    return (XT.T, f, A, ST, terms)
+    def predict(X):
+        pred_freq = ST @ X
+        return jnp.fft.irfft(pred_freq, n=n_timepoints, axis=1)
+
+    return (X_freq_full, predict, None, ST, terms)
 
 
 

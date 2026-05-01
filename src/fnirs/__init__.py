@@ -18,6 +18,7 @@ from .io import (
 
 from .model import (
     fit,
+    matern12_psd,
     create_spherical_harmonics_basis,
     create_1d_fourier_modes,
     evaluate_1d_fourier_basis,
@@ -60,6 +61,7 @@ __all__ = [
     "ChromophoreType",
     # Model
     "fit",
+    "matern12_psd",
     "create_spherical_harmonics_basis",
     "create_1d_fourier_modes",
     "evaluate_1d_fourier_basis",

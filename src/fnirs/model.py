@@ -6,6 +6,25 @@ from scipy.special import sph_harm_y
 from typing import List, Optional
 
 
+def matern12_psd(freqs: jnp.ndarray, lengthscale: float, variance: float) -> jnp.ndarray:
+    """
+    Matérn-1/2 (exponential kernel) power spectral density.
+
+    The Matérn-1/2 kernel is k(τ) = σ² exp(-|τ|/ℓ), and its 1D PSD is:
+        S(f) = 2σ²ℓ / (1 + (2πfℓ)²)
+
+    Args:
+        freqs: frequencies (in cycles per unit time), shape (n,)
+        lengthscale: ℓ, kernel lengthscale in same units as time axis
+        variance: σ², kernel variance
+
+    Returns:
+        PSD values, shape (n,)
+    """
+    omega = 2 * jnp.pi * freqs
+    return 2 * variance * lengthscale / (1 + (lengthscale * omega) ** 2)
+
+
 #@partial(jax.jit, static_argnames=("max_spherical_degree", "n_fourier_components"))
 def fit(
     t: jnp.array,
@@ -14,6 +33,9 @@ def fit(
     Y: jnp.ndarray,
     max_spherical_degree: int,
     n_fourier_components: int,
+    temporal_kernel: Optional[str] = None,
+    kernel_lengthscale: float = 1.0,
+    kernel_variance: float = 1.0,
 ):
     assert Y.shape[1] == len(t), "Y must have shape (n_channels, n_samples)"
     assert Y.shape[0] == len(θ) == len(ϕ), "Y must have shape (n_channels, n_samples)"
@@ -32,7 +54,37 @@ def fit(
     ATA = gram_diagonal(*args)
     lhs = ST.T @ ST
     rhs = ((AT(Y) @ ST) / ATA[:, None]).T
-    XT, *_ = jnp.linalg.lstsq(lhs, rhs, rcond=None)
+
+    if temporal_kernel is None:
+        XT, *_ = jnp.linalg.lstsq(lhs, rhs, rcond=None)
+    elif temporal_kernel == "matern12":
+        # Compute frequencies for each Fourier mode.
+        # Modes have integer frequency indices; the actual frequency in cycles
+        # per time unit depends on the sampling: the basis spans [0, 2π) over
+        # n_samples points, so mode index k completes k cycles in n_samples.
+        # With sampling interval dt = (t[-1] - t[0]) / (n_samples - 1), the
+        # total duration T ≈ n_samples * dt, giving f_k = k / T.
+        n_samples = len(t)
+        modes = create_1d_fourier_modes(n_samples, n_fourier_components)
+        mode_indices = modes[:, 0]  # integer frequency indices
+
+        dt = (t[-1] - t[0]) / (n_samples - 1)
+        duration = n_samples * dt
+        freqs = mode_indices / duration  # cycles per time unit
+
+        psd = matern12_psd(freqs, kernel_lengthscale, kernel_variance)
+        lambdas = 1.0 / psd  # regularization per Fourier mode
+
+        n_spatial = lhs.shape[0]
+        eye = jnp.eye(n_spatial)
+
+        # Solve per Fourier mode: (lhs + λ_k I) x_k = rhs_k
+        def solve_one(k):
+            return jnp.linalg.solve(lhs + lambdas[k] * eye, rhs[:, k])
+
+        XT = jax.vmap(solve_one)(jnp.arange(n_fourier_components)).T
+    else:
+        raise ValueError(f"Unknown temporal kernel: {temporal_kernel!r}")
 
     @jax.jit
     def f(X):

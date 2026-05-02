@@ -63,12 +63,20 @@ mesh = [
     "open3d>=0.18.0",
 ]
 
+[project.scripts]
+fnirs = "fnirs.cli:app"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["fnirs*"]
 
 [tool.uv]
 constraint-dependencies = ["llvm>0.43.0"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
 
 
 

@@ -40,30 +40,29 @@ def tddr(signal: np.ndarray, fs: float, max_iter: int = 50, tune: float = 4.685)
     s_low = filtfilt(b, a, s)
     s_high = s - s_low
 
-    # First-order derivative; prepend keeps length identical and starts at 0.
-    deriv = np.diff(s_low, prepend=s_low[0])
+    # First-order derivative (length T-1; the cumsum below restores T by prepending 0).
+    deriv = np.diff(s_low)
 
-    # Tukey biweight IRLS for the typical (non-motion) derivative scale.
-    eps = 1e-12
-    mu = 0.0
+    # Tukey biweight IRLS — matches Fishburn 2019 / TDDR.py reference.
+    # Iterate: μ ← weighted mean of derivative, σ ← MAD around current μ, w ← Tukey.
+    eps_guard = 1e-12
+    mu = float("inf")
+    w = np.ones_like(deriv)
     for _ in range(max_iter):
-        sigma = 1.4826 * np.median(np.abs(deriv - np.median(deriv))) + eps
+        mu_old = mu
+        mu = float((w * deriv).sum() / (w.sum() + eps_guard))
+        sigma = 1.4826 * np.median(np.abs(deriv - mu)) + eps_guard
         r = (deriv - mu) / (tune * sigma)
         w = np.where(np.abs(r) < 1, (1 - r ** 2) ** 2, 0.0)
-        new_mu = (w * deriv).sum() / (w.sum() + eps)
-        if abs(new_mu - mu) < eps * (abs(mu) + 1):
-            mu = new_mu
+        if abs(mu - mu_old) < np.sqrt(np.finfo(np.float64).eps) * max(abs(mu), abs(mu_old), 1.0):
             break
-        mu = new_mu
 
-    # Final weights — outlier derivatives get zeroed → motion stays in place.
-    sigma = 1.4826 * np.median(np.abs(deriv - np.median(deriv))) + eps
-    r = (deriv - mu) / (tune * sigma)
-    w = np.where(np.abs(r) < 1, (1 - r ** 2) ** 2, 0.0)
-    deriv_clean = w * deriv
+    # Cleaned derivative: outlier-suppressed deviation from the typical drift μ.
+    deriv_clean = w * (deriv - mu)
 
-    # Integrate and recombine.
-    s_low_clean = np.cumsum(deriv_clean) + s_low[0]
+    # Integrate (prepend 0 so length matches s_low), re-centre, recombine.
+    s_low_clean = np.cumsum(np.concatenate([[0.0], deriv_clean]))
+    s_low_clean = s_low_clean - s_low_clean.mean()
     return s_low_clean + s_high + signal_mean
 
 

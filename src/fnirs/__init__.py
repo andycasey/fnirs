@@ -1,5 +1,5 @@
 """
-fNIRS data analysis package for spatial-temporal modeling of hemodynamic responses.
+fNIRS data analysis: spatio-temporal Whittle GP for connectivity estimation.
 """
 
 from .io import (
@@ -16,24 +16,13 @@ from .io import (
     ChromophoreType,
 )
 
-from .model import (
+from .whittle import (
     fit,
-    matern12_psd,
-    create_spherical_harmonics_basis,
-    create_1d_fourier_modes,
-    evaluate_1d_fourier_basis,
-    fourier_matmat,
-    fourier_rmatmat,
-    gram_diagonal,
-)
-
-from .spherical_projection import (
-    project_fnirs_to_sphere,
-    project_to_sphere,
-    cartesian_to_spherical,
-    spherical_to_cartesian,
-    fit_sphere_to_head,
-    visualize_spherical_projection,
+    neg_log_likelihood,
+    posterior_mean,
+    matern32_psd,
+    sigma_from_params,
+    correlation_from_params,
 )
 
 # Optional mesh refinement (requires open3d)
@@ -61,19 +50,11 @@ __all__ = [
     "ChromophoreType",
     # Model
     "fit",
-    "create_spherical_harmonics_basis",
-    "create_1d_fourier_modes",
-    "evaluate_1d_fourier_basis",
-    "fourier_matmat",
-    "fourier_rmatmat",
-    "gram_diagonal",
-    # Spherical projection
-    "project_fnirs_to_sphere",
-    "project_to_sphere",
-    "cartesian_to_spherical",
-    "spherical_to_cartesian",
-    "fit_sphere_to_head",
-    "visualize_spherical_projection",
+    "neg_log_likelihood",
+    "posterior_mean",
+    "matern32_psd",
+    "sigma_from_params",
+    "correlation_from_params",
     # Mesh refinement
     "AdvancedSkullMeshRefinement",
 ]

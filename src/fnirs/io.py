@@ -348,20 +348,28 @@ def load_snirf_data(snirf_file_path: Union[str, Path]) -> NIRSData:
         for i, ml_key in enumerate(ml_keys):
             ml_group = data_group[ml_key]
             
-            # Extract measurement info
-            source_idx = int(ml_group['sourceIndex'][0])
-            detector_idx = int(ml_group['detectorIndex'][0])
-            wavelength_idx = int(ml_group['wavelengthIndex'][0])
-            data_type = int(ml_group['dataType'][0])
-            data_type_idx = int(ml_group['dataTypeIndex'][0])
+            # SNIRF spec is loose about whether scalar fields are stored as
+            # 1-element arrays or true scalar datasets; handle both.
+            def _scalar(dset):
+                arr = dset[()] if dset.shape == () else dset[0]
+                return arr.item() if hasattr(arr, "item") else arr
+
+            source_idx = int(_scalar(ml_group['sourceIndex']))
+            detector_idx = int(_scalar(ml_group['detectorIndex']))
+            wavelength_idx = int(_scalar(ml_group['wavelengthIndex']))
+            data_type = int(_scalar(ml_group['dataType']))
+            data_type_idx = int(_scalar(ml_group['dataTypeIndex']))
             data_type_label = _safe_decode_array(ml_group['dataTypeLabel'])
-            
-            # Get wavelength value
-            wavelength = wavelengths[wavelength_idx - 1]  # Convert to 0-based
-            
+
+            # Get wavelength value (use first wavelength as fallback for non-CW data types).
+            if 1 <= wavelength_idx <= len(wavelengths):
+                wavelength = wavelengths[wavelength_idx - 1]
+            else:
+                wavelength = float("nan")
+
             # Optional fields
             data_unit = _safe_decode_array(ml_group['dataUnit']) if 'dataUnit' in ml_group else None
-            module_idx = int(ml_group['moduleIndex'][0]) if 'moduleIndex' in ml_group else None
+            module_idx = int(_scalar(ml_group['moduleIndex'])) if 'moduleIndex' in ml_group else None
             
             measurement_info = MeasurementInfo(
                 source_index=source_idx,
@@ -414,6 +422,179 @@ def load_snirf_data(snirf_file_path: Union[str, Path]) -> NIRSData:
         )
         
         return nirs_data
+
+
+def _read_lob_mcos_arr(lob_path: Union[str, Path]) -> np.ndarray:
+    """Extract the cw_nirs MCOS property cell array from a .lob (MATLAB v5)
+    file. The MCOS bytes appear inside __function_workspace__; we replay
+    them through the v5 reader."""
+    import io as _io
+    from scipy.io import loadmat
+    from scipy.io.matlab._mio5 import MatFile5Reader
+
+    raw = loadmat(str(lob_path), squeeze_me=False, struct_as_record=True)
+    if "__function_workspace__" not in raw:
+        raise ValueError(f"{lob_path}: not an MCOS-style .lob file")
+    ws = raw["__function_workspace__"].tobytes()
+    fake = b"\x00" * 124 + b"\x00\x00IM" + ws
+    reader = MatFile5Reader(_io.BytesIO(fake))
+    reader.byte_order = "<"
+    reader.initialize_read()
+    reader.mat_stream.seek(128 + 8)
+    hdr, _ = reader.read_var_header()
+    top = reader.read_var_array(hdr, process=True)
+    return top["MCOS"][0, 0][0]["arr"]
+
+
+def load_lob_data(lob_file_path: Union[str, Path]) -> NIRSData:
+    """Load a .lob (cw_nirs) file as NIRSData with RAW intensity channels.
+
+    Each (source, detector, wavelength) triple becomes one channel with
+    data_type_label = 'RAW'. No motion correction or MBLL is applied; that's
+    the preprocess pipeline's job.
+    """
+    arr = _read_lob_mcos_arr(lob_file_path)
+    t = np.asarray(arr[2, 0]).flatten().astype(float)
+    d = np.asarray(arr[3, 0]).astype(float)               # (T, n_raw_channels)
+    sd = arr[6, 0][0, 0]
+    meas_list = np.asarray(sd["MeasList"]).astype(int)    # (n_raw, 4): src, det, gain, wav_idx
+    wavelengths = np.asarray(sd["Lambda"]).flatten().astype(float)
+    src_pos_3d = np.asarray(sd["SrcPos"]).astype(float)
+    det_pos_3d = np.asarray(sd["DetPos"]).astype(float)
+    spatial_unit = "mm"
+    if "SpatialUnit" in sd.dtype.names:
+        try:
+            spatial_unit = str(np.asarray(sd["SpatialUnit"]).flatten()[0])
+        except Exception:
+            pass
+
+    src_pos_2d = src_pos_3d[:, :2]
+    det_pos_2d = det_pos_3d[:, :2]
+
+    channels: List[FNIRSChannel] = []
+    for raw_idx, row in enumerate(meas_list):
+        src, det, _gain, wav = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+        wav_value = float(wavelengths[wav - 1]) if 1 <= wav <= len(wavelengths) else float("nan")
+        mi = MeasurementInfo(
+            source_index=src,
+            detector_index=det,
+            wavelength_index=wav,
+            data_type=DataType.RAW.value,
+            data_type_index=1,
+            data_type_label="RAW",
+            wavelength=wav_value,
+        )
+        ch = FNIRSChannel(
+            channel_idx=raw_idx,
+            measurement_info=mi,
+            source_pos_2d=src_pos_2d[src - 1],
+            detector_pos_2d=det_pos_2d[det - 1],
+            source_pos_3d=src_pos_3d[src - 1],
+            detector_pos_3d=det_pos_3d[det - 1],
+        )
+        channels.append(ch)
+
+    fs = 1.0 / float(np.mean(np.diff(t))) if len(t) > 1 else None
+    probe = ProbeInfo(
+        source_positions_2d=src_pos_2d,
+        detector_positions_2d=det_pos_2d,
+        source_positions_3d=src_pos_3d,
+        detector_positions_3d=det_pos_3d,
+        wavelengths=wavelengths,
+        frequency=fs,
+        length_unit=spatial_unit,
+    )
+
+    return NIRSData(
+        time_series=d,
+        time=t,
+        channels=channels,
+        probe=probe,
+        format_version="lob/cw_nirs",
+        metadata={"source_format": "lob", "LengthUnit": spatial_unit},
+    )
+
+
+def save_concentration_snirf(
+    output_path: Union[str, Path],
+    template: NIRSData,
+    time_series: np.ndarray,
+    measurement_list: list[dict],
+    metadata_extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write a SNIRF file with concentration data, copying probe + stim from a
+    template NIRSData and replacing the data block with the supplied
+    `time_series` and per-channel `measurement_list`.
+
+    `time_series` shape: (n_timepoints, n_channels).
+    Each entry in `measurement_list` is a dict with keys:
+        sourceIndex, detectorIndex, wavelengthIndex, dataType, dataTypeIndex,
+        dataTypeLabel, [dataUnit].
+    """
+    output_path = Path(output_path)
+    if time_series.shape[0] != len(template.time):
+        raise ValueError(
+            f"time_series rows ({time_series.shape[0]}) must equal template.time length "
+            f"({len(template.time)})"
+        )
+    if time_series.shape[1] != len(measurement_list):
+        raise ValueError(
+            f"time_series cols ({time_series.shape[1]}) must equal measurement_list length "
+            f"({len(measurement_list)})"
+        )
+
+    with h5py.File(output_path, "w") as f:
+        f.create_dataset("formatVersion", data=np.bytes_(template.format_version or "1.0"))
+        nirs = f.create_group("nirs")
+
+        meta = nirs.create_group("metaDataTags")
+        merged_meta: Dict[str, Any] = dict(template.metadata or {})
+        if metadata_extra:
+            merged_meta.update(metadata_extra)
+        for k, v in merged_meta.items():
+            try:
+                if isinstance(v, str):
+                    meta.create_dataset(k, data=np.bytes_(v))
+                elif isinstance(v, (bytes, np.bytes_)):
+                    meta.create_dataset(k, data=v)
+                elif isinstance(v, (int, float, np.integer, np.floating)):
+                    meta.create_dataset(k, data=v)
+                elif isinstance(v, np.ndarray):
+                    meta.create_dataset(k, data=v)
+                else:
+                    meta.create_dataset(k, data=np.bytes_(str(v)))
+            except Exception:
+                pass  # Skip metadata entries we can't serialize.
+
+        probe = nirs.create_group("probe")
+        probe.create_dataset("sourcePos2D", data=template.probe.source_positions_2d)
+        probe.create_dataset("detectorPos2D", data=template.probe.detector_positions_2d)
+        if template.probe.source_positions_3d is not None:
+            probe.create_dataset("sourcePos3D", data=template.probe.source_positions_3d)
+        if template.probe.detector_positions_3d is not None:
+            probe.create_dataset("detectorPos3D", data=template.probe.detector_positions_3d)
+        if template.probe.wavelengths is not None:
+            probe.create_dataset("wavelengths", data=np.asarray(template.probe.wavelengths))
+
+        data1 = nirs.create_group("data1")
+        data1.create_dataset("dataTimeSeries", data=np.asarray(time_series, dtype=np.float64))
+        data1.create_dataset("time", data=np.asarray(template.time, dtype=np.float64))
+        for i, ml in enumerate(measurement_list, start=1):
+            ml_g = data1.create_group(f"measurementList{i}")
+            ml_g.create_dataset("sourceIndex", data=np.array([int(ml["sourceIndex"])]))
+            ml_g.create_dataset("detectorIndex", data=np.array([int(ml["detectorIndex"])]))
+            ml_g.create_dataset("wavelengthIndex", data=np.array([int(ml["wavelengthIndex"])]))
+            ml_g.create_dataset("dataType", data=np.array([int(ml["dataType"])]))
+            ml_g.create_dataset("dataTypeIndex", data=np.array([int(ml["dataTypeIndex"])]))
+            ml_g.create_dataset("dataTypeLabel", data=np.bytes_(str(ml["dataTypeLabel"])))
+            if "dataUnit" in ml and ml["dataUnit"] is not None:
+                ml_g.create_dataset("dataUnit", data=np.bytes_(str(ml["dataUnit"])))
+
+        if template.stimulus:
+            for i, stim in enumerate(template.stimulus, start=1):
+                stim_g = nirs.create_group(f"stim{i}")
+                stim_g.create_dataset("name", data=np.bytes_(stim.name))
+                stim_g.create_dataset("data", data=np.asarray(stim.data))
 
 
 # ========================================================================

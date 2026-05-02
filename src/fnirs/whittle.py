@@ -122,8 +122,16 @@ def _eig_decompose(params: dict):
 # Likelihood and posterior
 # ---------------------------------------------------------------------------
 
-def neg_log_likelihood(params: dict, Y: jnp.ndarray) -> jnp.ndarray:
-    """Whittle negative log-likelihood for Y of shape (N, T)."""
+def neg_log_likelihood(params: dict, Y: jnp.ndarray, nu: float | None = None) -> jnp.ndarray:
+    """Whittle negative log-likelihood for Y of shape (N, T).
+
+    If `nu` is None: per-frequency multivariate Gaussian (default).
+    If `nu` is finite: per-frequency multivariate Student-t with `nu` degrees
+    of freedom. This downweights frequency bins whose Mahalanobis distance is
+    large, giving robust fits in the presence of outlier frequency components.
+    """
+    from jax.scipy.special import gammaln
+
     N, T = Y.shape
 
     Yc = Y - Y.mean(axis=-1, keepdims=True)
@@ -138,7 +146,7 @@ def neg_log_likelihood(params: dict, Y: jnp.ndarray) -> jnp.ndarray:
 
     Wk = U.T.astype(Yk.dtype) @ (inv_sqrt_d[:, None].astype(Yk.dtype) * Yk)
 
-    eig = psd[:, None] * lam[None, :] + 1.0  # (F, N), real positive
+    eig = psd[:, None] * lam[None, :] + 1.0  # (F, N)
 
     log_d = params["log_sigma2"].sum()
     log_det_TC = N * jnp.log(T) + log_d + jnp.log(eig).sum(axis=-1)  # (F,)
@@ -150,8 +158,24 @@ def neg_log_likelihood(params: dict, Y: jnp.ndarray) -> jnp.ndarray:
     if T % 2 == 0:
         is_real = is_real.at[-1].set(True)
 
-    ll_real = -0.5 * N * jnp.log(2 * jnp.pi) - 0.5 * log_det_TC - 0.5 * quad
-    ll_complex = -N * jnp.log(jnp.pi) - log_det_TC - quad
+    if nu is None:
+        ll_real = -0.5 * N * jnp.log(2 * jnp.pi) - 0.5 * log_det_TC - 0.5 * quad
+        ll_complex = -N * jnp.log(jnp.pi) - log_det_TC - quad
+    else:
+        # Multivariate t per frequency bin. Real bin (k=0, T/2): standard
+        # multivariate t in N real dimensions. Complex bin: derived as the
+        # χ²-mixture of CN(0, (ν/s)Σ) under our Convention-2 CCN density
+        # (p_g = π^(-N) |Σ|^{-1} exp(-z^H Σ^{-1} z)). Both forms reduce to the
+        # corresponding Gaussian as ν → ∞.
+        ll_real = (gammaln(0.5 * (nu + N)) - gammaln(0.5 * nu)
+                   - 0.5 * N * jnp.log(jnp.pi * nu)
+                   - 0.5 * log_det_TC
+                   - 0.5 * (nu + N) * jnp.log1p(quad / nu))
+        ll_complex = (gammaln(N + 0.5 * nu) - gammaln(0.5 * nu)
+                      - N * jnp.log(0.5 * jnp.pi * nu)
+                      - log_det_TC
+                      - (N + 0.5 * nu) * jnp.log1p(2.0 * quad / nu))
+
     ll = jnp.where(is_real, ll_real, ll_complex)
     return -ll.sum()
 
@@ -257,6 +281,8 @@ def fit(
     log_sigma_max: float | None = None,
     log_ell_min: float | None = None,
     log_ell_max: float | None = None,
+    fixed_log_sigma2: np.ndarray | None = None,
+    nu: float | None = None,
 ) -> dict:
     """Fit the Whittle GP to Y of shape (N, T) and return a summary dict.
 
@@ -295,12 +321,22 @@ def fit(
     init_length_scale = float(np.exp(log_init_ell))
 
     params0 = _init_params(N, r, init_length_scale, init_noise, seed=seed)
+
+    # If per-channel σ are pinned, override the init.
+    if fixed_log_sigma2 is not None:
+        fixed_log_sigma2 = np.asarray(fixed_log_sigma2, dtype=np.float64)
+        if fixed_log_sigma2.shape != (N,):
+            raise ValueError(f"fixed_log_sigma2 must have shape ({N},), got {fixed_log_sigma2.shape}")
+        params0["log_sigma2"] = jnp.asarray(fixed_log_sigma2)
+
     Y_j = jnp.asarray(Y_np)
+
+    nu_jnp = None if nu is None else float(nu)
 
     @jax.jit
     def value_and_grad_flat(flat):
         params = unpack(flat, N, r)
-        return jax.value_and_grad(neg_log_likelihood)(params, Y_j)
+        return jax.value_and_grad(lambda p: neg_log_likelihood(p, Y_j, nu_jnp))(params)
 
     losses: list[float] = []
 
@@ -328,12 +364,17 @@ def fit(
 
     has_sigma_bounds = log_sigma_min is not None or log_sigma_max is not None
     has_ell_bounds = log_ell_min is not None or log_ell_max is not None
+    has_fixed_sigma = fixed_log_sigma2 is not None
     bounds: list[tuple[float | None, float | None]] | None = None
-    if has_sigma_bounds or has_ell_bounds:
+    if has_sigma_bounds or has_ell_bounds or has_fixed_sigma:
         bounds = [(None, None)] * x0.size
         # Layout: [L (N*r), log_d (N), log_sigma2 (N), log_ell (1)].
         sigma2_start = N * r + N
-        if has_sigma_bounds:
+        if has_fixed_sigma:
+            for j in range(sigma2_start, sigma2_start + N):
+                v = float(fixed_log_sigma2[j - sigma2_start])
+                bounds[j] = (v, v)
+        elif has_sigma_bounds:
             lo = 2.0 * log_sigma_min if log_sigma_min is not None else None
             hi = 2.0 * log_sigma_max if log_sigma_max is not None else None
             for j in range(sigma2_start, sigma2_start + N):

@@ -10,6 +10,111 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+def plot_montage_metric(
+    midpoints: np.ndarray,
+    source_pos: np.ndarray,
+    detector_pos: np.ndarray,
+    src_indices: np.ndarray,
+    det_indices: np.ndarray,
+    values: np.ndarray,
+    channel_labels: np.ndarray | None,
+    output_path: Path,
+    metric_name: str = "metric",
+    title: str | None = None,
+    cmap: str = "viridis",
+    log_scale: bool = False,
+):
+    """Topographic montage with per-channel scalar overlaid as colour at the
+    channel midpoint. Sources are red dots with index labels, detectors blue.
+    """
+    midpoints = np.asarray(midpoints)
+    source_pos = np.asarray(source_pos)
+    detector_pos = np.asarray(detector_pos)
+    values = np.asarray(values, dtype=float)
+
+    # Unique source / detector positions, keyed by index for labels.
+    src_map: dict[int, np.ndarray] = {}
+    for idx, pos in zip(src_indices, source_pos):
+        src_map.setdefault(int(idx), pos)
+    det_map: dict[int, np.ndarray] = {}
+    for idx, pos in zip(det_indices, detector_pos):
+        det_map.setdefault(int(idx), pos)
+    src_idx_unique = np.array(sorted(src_map))
+    det_idx_unique = np.array(sorted(det_map))
+    src_unique = np.array([src_map[i] for i in src_idx_unique])
+    det_unique = np.array([det_map[i] for i in det_idx_unique])
+
+    all_pts = np.vstack([midpoints, src_unique, det_unique])
+    center = all_pts.mean(axis=0)
+    radius = float(np.max(np.linalg.norm(all_pts - center, axis=1))) * 1.15
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    # Head outline + nose tick.
+    theta = np.linspace(0, 2 * np.pi, 256)
+    ax.plot(
+        center[0] + radius * np.cos(theta),
+        center[1] + radius * np.sin(theta),
+        color="black", linewidth=1.2,
+    )
+    nose_w, nose_h = radius * 0.08, radius * 0.10
+    ax.plot(
+        [center[0] - nose_w, center[0], center[0] + nose_w],
+        [center[1] + radius, center[1] + radius + nose_h, center[1] + radius],
+        color="black", linewidth=1.2,
+    )
+
+    # Channel lines (background, faint).
+    for s, d in zip(source_pos, detector_pos):
+        ax.plot([s[0], d[0]], [s[1], d[1]], color="0.85", linewidth=0.8, zorder=1)
+
+    # Source/detector dots with index labels in white.
+    ax.scatter(
+        src_unique[:, 0], src_unique[:, 1],
+        s=140, c="red", edgecolors="black", linewidths=0.5, zorder=3, label="source",
+    )
+    for i, (sx, sy) in zip(src_idx_unique, src_unique):
+        ax.text(sx, sy, str(int(i)), fontsize=6, color="white", fontweight="bold",
+                ha="center", va="center", zorder=4)
+    ax.scatter(
+        det_unique[:, 0], det_unique[:, 1],
+        s=140, c="royalblue", edgecolors="black", linewidths=0.5, zorder=3, label="detector",
+    )
+    for i, (dx, dy) in zip(det_idx_unique, det_unique):
+        ax.text(dx, dy, str(int(i)), fontsize=6, color="white", fontweight="bold",
+                ha="center", va="center", zorder=4)
+
+    # Channel midpoints, coloured by metric.
+    plot_values = np.log10(np.maximum(values, 1e-30)) if log_scale else values
+    sc = ax.scatter(
+        midpoints[:, 0], midpoints[:, 1],
+        s=220, c=plot_values, cmap=cmap,
+        edgecolors="black", linewidths=0.8, zorder=5,
+    )
+    if channel_labels is not None:
+        offset = radius * 0.025
+        for (mx, my), lbl in zip(midpoints, channel_labels):
+            ax.text(mx + offset, my + offset, str(lbl),
+                    fontsize=5, color="black", zorder=6, ha="left", va="bottom")
+
+    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(f"log10({metric_name})" if log_scale else metric_name, fontsize=9)
+    pad = radius * 0.15
+    ax.set_xlim(center[0] - radius - pad, center[0] + radius + pad)
+    ax.set_ylim(center[1] - radius - pad, center[1] + radius + pad)
+    ax.legend(loc="lower right", fontsize=8, frameon=False)
+    if title:
+        ax.set_title(title, fontsize=11)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _contiguous_true_runs(mask_row: np.ndarray) -> list[tuple[int, int]]:
     """Return list of (start, end) sample indices for each contiguous True run."""
     mask = np.asarray(mask_row).astype(bool)

@@ -78,6 +78,102 @@ def _build_validation_mask(N, T, val_fraction, mode, chunk_size, rng):
     return mask, desc
 
 
+def _canonical_hrf_kernel(fs: float, length_s: float = 32.0,
+                           peak: float = 6.0, undershoot: float = 16.0,
+                           ratio: float = 6.0) -> "np.ndarray":
+    """Discrete-time SPM-style double-gamma canonical HRF kernel.
+
+    h(t) = Γ-pdf(t; α=peak) − Γ-pdf(t; α=undershoot) / ratio  (scale=1, in seconds).
+    Truncated to `length_s` seconds and area-normalised.
+    """
+    import numpy as np
+    from scipy.stats import gamma
+
+    n = max(1, int(round(length_s * fs)))
+    t = np.arange(n) / fs
+    h = gamma.pdf(t, peak, scale=1.0) - gamma.pdf(t, undershoot, scale=1.0) / ratio
+    s = h.sum()
+    return h / s if s != 0 else h
+
+
+def _build_glm_design_matrix(
+    n_t: int,
+    dt: float,
+    stim_onsets,
+    stim_durations,
+    short_signals=None,
+    *,
+    regress_stim: bool = True,
+    regress_short_channels: bool = True,
+    regress_drift: bool = True,
+    drift_order: int = 1,
+    hrf_peak: float = 6.0,
+    hrf_undershoot: float = 16.0,
+):
+    """Build the GLM design matrix `X` (n_t × n_reg) and a list of regressor names.
+
+    Columns (in order, depending on flags):
+        intercept | drift_p1 ... drift_pK | stim_HRF (one per stim group, if any)
+        | short_<label> (one per short-channel input row, if any)
+
+    `short_signals` is (n_short_inputs, n_t), already preprocessed (e.g. HbO+HbR
+    of short-separation channels). Each row becomes one regressor column.
+    """
+    import numpy as np
+
+    fs = 1.0 / dt
+    cols = []
+    names = []
+
+    # Intercept (always present so the residual is mean-zero by construction).
+    cols.append(np.ones(n_t))
+    names.append("intercept")
+
+    if regress_drift:
+        t_norm = np.linspace(-1.0, 1.0, n_t)
+        for p in range(1, max(1, int(drift_order)) + 1):
+            cols.append(t_norm ** p)
+            names.append(f"drift_p{p}")
+
+    if regress_stim and len(stim_onsets) > 0:
+        # Build a single boxcar covering all stim events, convolve with the HRF.
+        boxcar = np.zeros(n_t)
+        for onset, dur in zip(stim_onsets, stim_durations):
+            i_start = max(0, int(round(float(onset) * fs)))
+            i_end = min(n_t, int(round((float(onset) + float(dur)) * fs)))
+            if i_end > i_start:
+                boxcar[i_start:i_end] = 1.0
+        kernel = _canonical_hrf_kernel(fs, length_s=32.0, peak=hrf_peak, undershoot=hrf_undershoot)
+        stim_reg = np.convolve(boxcar, kernel, mode="full")[:n_t]
+        cols.append(stim_reg)
+        names.append("stim_HRF")
+
+    if regress_short_channels and short_signals is not None:
+        short_signals = np.asarray(short_signals, dtype=np.float64)
+        if short_signals.shape[1] != n_t:
+            raise ValueError(f"short_signals second axis must equal n_t={n_t}, got {short_signals.shape}")
+        for i in range(short_signals.shape[0]):
+            cols.append(short_signals[i] - short_signals[i].mean())
+            names.append(f"short_{i}")
+
+    X = np.stack(cols, axis=-1)
+    return X, names
+
+
+def _glm_regress(Y, X):
+    """Per-row OLS regression of Y on X, subtract the fit. Returns (Y_clean, betas).
+
+    Y: (n_channels, n_t).  X: (n_t, n_reg).  betas: (n_reg, n_channels).
+    """
+    import numpy as np
+
+    XTX = X.T @ X
+    XTY = X.T @ Y.T
+    betas = np.linalg.solve(XTX + 1e-10 * np.eye(XTX.shape[0]), XTY)  # (n_reg, n_ch)
+    Y_clean = Y - (X @ betas).T
+    return Y_clean, betas
+
+
 def _short_channel_pca_regress(Y_long, Y_short, n_components: int):
     """Regress top-k PCA temporal components of Y_short out of Y_long.
 
@@ -143,7 +239,7 @@ def fit(
     output: Path = typer.Argument(..., help="Output directory for results"),
     chromophore: str = typer.Option("hbo", help="Chromophore: hbo, hbr, or hbt"),
     init_length_scale: float = typer.Option(30.0, help="Initial Matérn-3/2 length scale (samples)"),
-    n_iter: int = typer.Option(100, help="Max LBFGS iterations"),
+    n_iter: int = typer.Option(10000, help="Max LBFGS iterations"),
     seed: int = typer.Option(0, help="Seed for parameter initialisation"),
     verbose: bool = typer.Option(True, help="Print per-iteration progress"),
     plots: bool = typer.Option(True, "--plots/--no-plots", help="Generate diagnostic plots after fitting"),
@@ -152,25 +248,46 @@ def fit(
         "--include-short-channels",
         help="Include short-separation channels (default: excluded; they measure superficial physiology, not cortex).",
     ),
-    short_pca_components: int = typer.Option(
-        0,
-        "--short-pca-components",
-        help="Run PCA on the short-separation channels (top-k temporal components) and regress them out of the long channels before fitting. 0 = disabled.",
+    regress_short_channels: bool = typer.Option(
+        True,
+        "--regress-short-channels/--no-regress-short-channels",
+        help="GLM-regress the short-separation channel time series (HbO + HbR) out of the long channels before fitting (= GLMSSRC: superficial physiology removal).",
     ),
-    global_pca_components: int = typer.Option(
-        0,
-        "--global-pca-components",
-        help="After short-channel regression, decompose the long-channel data as Y = W H + GP + noise with H = top-k right singular vectors of Y, fit W in closed form, and subtract W H before the GP. 0 = disabled.",
+    regress_stim: bool = typer.Option(
+        True,
+        "--regress-stim/--no-regress-stim",
+        help="GLM-regress the HRF-convolved stim boxcar (using SNIRF stim events) out of the long channels — leaves the 'background connectivity' residual.",
+    ),
+    regress_drift: bool = typer.Option(
+        True,
+        "--regress-drift/--no-regress-drift",
+        help="Include polynomial drift regressors of order --drift-order (default 1, i.e. linear).",
+    ),
+    drift_order: int = typer.Option(
+        1, "--drift-order",
+        help="Polynomial drift order: 1=linear, 2=quadratic, etc. Only used when --regress-drift is on.",
+    ),
+    hrf_peak: float = typer.Option(
+        6.0, "--hrf-peak",
+        help="Canonical HRF peak time (seconds). Default 6.",
+    ),
+    hrf_undershoot: float = typer.Option(
+        16.0, "--hrf-undershoot",
+        help="Canonical HRF undershoot time (seconds). Default 16.",
+    ),
+    post_glm_pca_components: int = typer.Option(
+        0, "--post-glm-pca-components",
+        help="After the explicit GLM, optionally run PCA on the GLM-residual long-channel data and subtract the top K modes (CompCor-style data-driven backup). 0 = off (default).",
     ),
     log_sigma_min: Optional[float] = typer.Option(
-        -4.0,
+        2.6,
         "--log-sigma-min",
-        help="Lower bound on log σ (uniform prior). σ is the per-channel noise std. Default: -4.",
+        help="Lower bound on log σ (uniform prior). σ is the per-channel noise std. Default: 2.6.",
     ),
     log_sigma_max: Optional[float] = typer.Option(
-        1.0,
+        4.0,
         "--log-sigma-max",
-        help="Upper bound on log σ (uniform prior). Default: 1.",
+        help="Upper bound on log σ (uniform prior). Default: 4.",
     ),
     min_length_scale: Optional[float] = typer.Option(
         None,
@@ -178,22 +295,27 @@ def fit(
         help="Lower bound on the Matérn-3/2 length scale (samples). Default: unbounded.",
     ),
     max_length_scale: Optional[float] = typer.Option(
-        None,
+        60.0,
         "--max-length-scale",
-        help="Upper bound on the Matérn-3/2 length scale (samples). Default: unbounded.",
+        help="Upper bound on the Matérn-3/2 length scale (samples). Default: 60.",
     ),
     rank: Optional[int] = typer.Option(
-        None,
+        4,
         "--rank",
-        help="Rank r of the channel covariance Σ = L Lᵀ + diag(d), with L ∈ ℝ^{N×r}. Default: full rank N.",
+        help="Rank r of the channel covariance Σ = L Lᵀ + diag(d), with L ∈ ℝ^{N×r}. Default: 4.",
     ),
     seed_channel_index: Optional[int] = typer.Option(
-        None,
+        6,
         "--seed-channel-index",
         help="Channel row to use as a seed for a quick mean-correlation summary printed at the end of the fit.",
     ),
+    seed_k_neighbors: int = typer.Option(
+        2,
+        "--seed-k-neighbors",
+        help="When --seed-channel-index is set, also print the max correlation among the K physically closest channels (using 3D channel midpoints).",
+    ),
     validation_fraction: float = typer.Option(
-        0.0,
+        0.1,
         "--validation-fraction",
         help="Total fraction of timepoints to hold out per channel for validation. 0 = disabled.",
     ),
@@ -206,6 +328,16 @@ def fit(
         "independent",
         "--validation-mode",
         help="independent = per-channel random chunks (default; tests full model). synchronous = same chunks across all channels (tests temporal kernel only). disjoint = non-overlapping across channels, ≤1 channel masked at any time (matrix-completion CV; tests connectivity).",
+    ),
+    two_pass: bool = typer.Option(
+        True,
+        "--two-pass/--no-two-pass",
+        help="After the first fit, set per-channel σ_i to the validation residual RMS (the irreducible noise estimate) and refit with σ_i FIXED. Identifies σ from data and pins Σ_ii = Var(Y_i) − σ_i² so the off-diagonal Σ is the only free part. Requires --validation-fraction > 0.",
+    ),
+    nu: Optional[float] = typer.Option(
+        None,
+        "--nu",
+        help="Degrees of freedom for a Student-t Whittle likelihood (per-frequency multivariate t). Smaller = more robust to outlier frequencies. Typical values: 4–10. None = Gaussian (default).",
     ),
 ):
     """Fit the Whittle spatio-temporal GP to fNIRS data."""
@@ -271,41 +403,12 @@ def fit(
             stim_onsets = np.zeros(0, dtype=np.float64)
             stim_durations = np.zeros(0, dtype=np.float64)
 
-        short_pca_basis = None
-        short_pca_betas = None
-        short_pca_sv = None
-        if short_pca_components > 0:
-            if include_short_channels:
-                typer.echo("Warning: --short-pca-components ignored when --include-short-channels is set.")
-            elif not short_channels_in_label:
-                typer.echo(f"Warning: --short-pca-components={short_pca_components} requested but no short {target_label} channels available.")
-            else:
-                short_idx = np.array([ch.channel_idx for ch in short_channels_in_label])
-                Y_short = nirs_data.time_series[:, short_idx].T
-                Y, short_pca_basis, short_pca_betas, short_pca_sv = _short_channel_pca_regress(
-                    Y, Y_short, short_pca_components
-                )
-                _, S_all, _ = np.linalg.svd(Y_short - Y_short.mean(axis=1, keepdims=True), full_matrices=False)
-                var_explained = float(np.sum(short_pca_sv ** 2) / np.sum(S_all ** 2)) if S_all.size else 0.0
-                typer.echo(
-                    f"Regressed top-{short_pca_basis.shape[0]} PCA components of {len(short_idx)} short channels "
-                    f"out of {Y.shape[0]} long channels (var explained in shorts: {100 * var_explained:.1f}%)."
-                )
-
-        global_pca_basis = None
-        global_pca_weights = None
-        global_pca_sv = None
-        if global_pca_components > 0:
-            Y, global_pca_basis, global_pca_weights, global_pca_sv = _global_pca_regress(
-                Y, global_pca_components
-            )
-            _, S_all, _ = np.linalg.svd(Y - Y.mean(axis=1, keepdims=True), full_matrices=False)
-            total_var = float(np.sum(global_pca_sv ** 2) + np.sum(S_all ** 2))
-            ve = float(np.sum(global_pca_sv ** 2) / total_var) if total_var > 0 else 0.0
-            typer.echo(
-                f"Regressed top-{global_pca_basis.shape[0]} global PCA components out of "
-                f"{Y.shape[0]} channels (var explained pre-regression: {100 * ve:.1f}%)."
-            )
+        # Short-channel time series (same chromophore as Y), for GLM regression.
+        if short_channels_in_label and not include_short_channels:
+            _short_idx = np.array([ch.channel_idx for ch in short_channels_in_label])
+            short_signals_for_glm = nirs_data.time_series[:, _short_idx].T
+        else:
+            short_signals_for_glm = None
     else:
         hemo_data = load_hemodynamic_data(data_path)
         chrom_map = {"hbo": ChromophoreType.HbO, "hbr": ChromophoreType.HbR, "hbt": ChromophoreType.HbT}
@@ -327,41 +430,10 @@ def fit(
         positions_3d = positions_3d_all[ch_indices] if positions_3d_all is not None else None
         ch_labels = np.array([f"S{hemo_data.channels[i].source_idx}-D{hemo_data.channels[i].detector_idx}" for i in ch_indices])
 
-        short_pca_basis = None
-        short_pca_betas = None
-        short_pca_sv = None
-        if short_pca_components > 0:
-            short_idx = np.flatnonzero(is_short)
-            if include_short_channels:
-                typer.echo("Warning: --short-pca-components ignored when --include-short-channels is set.")
-            elif short_idx.size == 0:
-                typer.echo(f"Warning: --short-pca-components={short_pca_components} requested but no short channels available.")
-            else:
-                Y_short = Y_full[short_idx]
-                Y, short_pca_basis, short_pca_betas, short_pca_sv = _short_channel_pca_regress(
-                    Y, Y_short, short_pca_components
-                )
-                _, S_all, _ = np.linalg.svd(Y_short - Y_short.mean(axis=1, keepdims=True), full_matrices=False)
-                var_explained = float(np.sum(short_pca_sv ** 2) / np.sum(S_all ** 2)) if S_all.size else 0.0
-                typer.echo(
-                    f"Regressed top-{short_pca_basis.shape[0]} PCA components of {len(short_idx)} short channels "
-                    f"out of {Y.shape[0]} long channels (var explained in shorts: {100 * var_explained:.1f}%)."
-                )
-
-        global_pca_basis = None
-        global_pca_weights = None
-        global_pca_sv = None
-        if global_pca_components > 0:
-            Y, global_pca_basis, global_pca_weights, global_pca_sv = _global_pca_regress(
-                Y, global_pca_components
-            )
-            _, S_all, _ = np.linalg.svd(Y - Y.mean(axis=1, keepdims=True), full_matrices=False)
-            total_var = float(np.sum(global_pca_sv ** 2) + np.sum(S_all ** 2))
-            ve = float(np.sum(global_pca_sv ** 2) / total_var) if total_var > 0 else 0.0
-            typer.echo(
-                f"Regressed top-{global_pca_basis.shape[0]} global PCA components out of "
-                f"{Y.shape[0]} channels (var explained pre-regression: {100 * ve:.1f}%)."
-            )
+        if not include_short_channels and is_short.any():
+            short_signals_for_glm = Y_full[np.flatnonzero(is_short)]
+        else:
+            short_signals_for_glm = None
         short_msg = (
             f", excluded {n_short} short" if (n_short and not include_short_channels)
             else (f", including {n_short} short" if include_short_channels and n_short else "")
@@ -372,7 +444,52 @@ def fit(
         stim_durations = np.zeros(0, dtype=np.float64)
 
     Y = np.asarray(Y, dtype=np.float64)
-    Y_original = Y.copy()  # stays untouched; npz "Y" field saves this.
+    dt = float(t[1] - t[0]) if len(t) >= 2 else 1.0
+
+    # GLM regression of nuisance signals (drift, HRF×stim, short-channel HbO/HbR).
+    glm_X = None
+    glm_betas = None
+    glm_names: list = []
+    if regress_drift or regress_stim or regress_short_channels:
+        Xmat, glm_names = _build_glm_design_matrix(
+            Y.shape[1], dt, stim_onsets, stim_durations,
+            short_signals=short_signals_for_glm,
+            regress_stim=regress_stim,
+            regress_short_channels=regress_short_channels,
+            regress_drift=regress_drift,
+            drift_order=drift_order,
+            hrf_peak=hrf_peak,
+            hrf_undershoot=hrf_undershoot,
+        )
+        # Always include the intercept (1 col); skip GLM only if that's the only column.
+        if Xmat.shape[1] > 1:
+            Y, glm_betas = _glm_regress(Y, Xmat)
+            glm_X = Xmat
+            n_short_used = sum(1 for n in glm_names if n.startswith("short_"))
+            n_drift_used = sum(1 for n in glm_names if n.startswith("drift_"))
+            stim_present = any(n == "stim_HRF" for n in glm_names)
+            typer.echo(
+                f"GLM regression: {len(glm_names)} regressors "
+                f"(drift_order={n_drift_used}, stim_HRF={stim_present}, n_short={n_short_used})."
+            )
+
+    # Optional CompCor-style data-driven PCA on the GLM-residual (off by default).
+    glm_residual_pca_basis = None
+    glm_residual_pca_weights = None
+    glm_residual_pca_sv = None
+    if post_glm_pca_components > 0:
+        Y, glm_residual_pca_basis, glm_residual_pca_weights, glm_residual_pca_sv = _global_pca_regress(
+            Y, post_glm_pca_components
+        )
+        _, S_all, _ = np.linalg.svd(Y - Y.mean(axis=1, keepdims=True), full_matrices=False)
+        total_var = float(np.sum(glm_residual_pca_sv ** 2) + np.sum(S_all ** 2))
+        ve = float(np.sum(glm_residual_pca_sv ** 2) / total_var) if total_var > 0 else 0.0
+        typer.echo(
+            f"Post-GLM PCA: removed top-{glm_residual_pca_basis.shape[0]} residual common modes "
+            f"({100 * ve:.1f}% of pre-removal variance)."
+        )
+
+    Y_original = Y.copy()  # stays untouched; npz "Y" field saves this (post-regression).
     val_mask = None
     if validation_fraction > 0:
         if not 0 < validation_fraction < 1:
@@ -389,10 +506,12 @@ def fit(
             ch_mean = float(Y[i, ~val_mask[i]].mean())
             Y[i, val_mask[i]] = ch_mean
         typer.echo(f"Validation: {desc}.")
-    dt = float(t[1] - t[0]) if len(t) >= 2 else 1.0
 
     log_ell_min = float(np.log(min_length_scale)) if min_length_scale is not None else None
     log_ell_max = float(np.log(max_length_scale)) if max_length_scale is not None else None
+
+    if two_pass and val_mask is None:
+        raise typer.BadParameter("--two-pass requires --validation-fraction > 0")
 
     res = whittle_fit(
         Y,
@@ -405,7 +524,39 @@ def fit(
         log_sigma_max=log_sigma_max,
         log_ell_min=log_ell_min,
         log_ell_max=log_ell_max,
+        nu=nu,
     )
+
+    res_pass1 = None
+    if two_pass:
+        # Per-channel out-of-sample residual std (= empirical noise estimate).
+        z1 = res["posterior_mean"]
+        N_ch = Y.shape[0]
+        sigma_emp = np.zeros(N_ch)
+        for i in range(N_ch):
+            sigma_emp[i] = float(np.sqrt(np.mean((Y_original[i, val_mask[i]] - z1[i, val_mask[i]]) ** 2)))
+        # Clip so σ_i² < Var(Y_i) (otherwise Σ_ii ≤ 0).
+        ch_var = Y_original.var(axis=1)
+        sigma_emp = np.minimum(sigma_emp, 0.99 * np.sqrt(ch_var))
+        sigma_emp = np.maximum(sigma_emp, 1e-6)
+        fixed_log_sigma2 = 2.0 * np.log(sigma_emp)
+        typer.echo(
+            f"Two-pass: per-channel σ from val residuals — median={float(np.median(sigma_emp)):.3f}, "
+            f"range=[{float(sigma_emp.min()):.3f}, {float(sigma_emp.max()):.3f}]. Refitting with σ_i fixed."
+        )
+        res_pass1 = res
+        res = whittle_fit(
+            Y,
+            rank=rank,
+            init_length_scale=res_pass1["length_scale"],
+            n_iter=n_iter,
+            verbose=verbose,
+            seed=seed,
+            log_ell_min=log_ell_min,
+            log_ell_max=log_ell_max,
+            fixed_log_sigma2=fixed_log_sigma2,
+            nu=nu,
+        )
 
     output.mkdir(parents=True, exist_ok=True)
 
@@ -428,14 +579,33 @@ def fit(
         stim_onsets=stim_onsets,
         stim_durations=stim_durations,
     )
-    if short_pca_basis is not None:
-        save_dict["short_pca_basis"] = np.asarray(short_pca_basis, dtype=np.float64)
-        save_dict["short_pca_betas"] = np.asarray(short_pca_betas, dtype=np.float64)
-        save_dict["short_pca_singular_values"] = np.asarray(short_pca_sv, dtype=np.float64)
-    if global_pca_basis is not None:
-        save_dict["global_pca_basis"] = np.asarray(global_pca_basis, dtype=np.float64)
-        save_dict["global_pca_weights"] = np.asarray(global_pca_weights, dtype=np.float64)
-        save_dict["global_pca_singular_values"] = np.asarray(global_pca_sv, dtype=np.float64)
+    if glm_X is not None:
+        save_dict["glm_X"] = np.asarray(glm_X, dtype=np.float64)
+        save_dict["glm_betas"] = np.asarray(glm_betas, dtype=np.float64)
+        save_dict["glm_regressor_names"] = np.asarray(glm_names)
+    if glm_residual_pca_basis is not None:
+        save_dict["glm_residual_pca_basis"] = np.asarray(glm_residual_pca_basis, dtype=np.float64)
+        save_dict["glm_residual_pca_weights"] = np.asarray(glm_residual_pca_weights, dtype=np.float64)
+        save_dict["glm_residual_pca_singular_values"] = np.asarray(glm_residual_pca_sv, dtype=np.float64)
+
+    # Functional connectivity:
+    #   fc_pearson_data  : Pearson r on (post-GLM-regression) channel data Y —
+    #                      what fNIRS papers compute and report.
+    #   fc_pearson_denoised: Pearson r on E[z|Y] — the GP's denoised latent;
+    #                      the principled "model FC" for our pipeline.
+    fc_pearson_data = np.corrcoef(Y_original)
+    fc_pearson_data = np.where(np.isfinite(fc_pearson_data), fc_pearson_data, 0.0)
+    fc_pearson_denoised = np.corrcoef(res["posterior_mean"])
+    fc_pearson_denoised = np.where(np.isfinite(fc_pearson_denoised), fc_pearson_denoised, 0.0)
+    save_dict["fc_pearson_data"] = fc_pearson_data
+    save_dict["fc_pearson_denoised"] = fc_pearson_denoised
+    save_dict["fc_fisher_z_denoised"] = np.arctanh(np.clip(fc_pearson_denoised, -0.999999, 0.999999))
+
+    if res_pass1 is not None:
+        save_dict["sigma_pass1"] = res_pass1["sigma"]
+        save_dict["correlation_pass1"] = res_pass1["correlation"]
+        save_dict["noise_var_pass1"] = res_pass1["noise_var"]
+        save_dict["length_scale_pass1"] = np.float64(res_pass1["length_scale"])
 
     config = dict(
         data=str(data),
@@ -444,8 +614,13 @@ def fit(
         n_iter=n_iter,
         seed=seed,
         include_short_channels=include_short_channels,
-        short_pca_components=short_pca_components,
-        global_pca_components=global_pca_components,
+        regress_short_channels=regress_short_channels,
+        regress_stim=regress_stim,
+        regress_drift=regress_drift,
+        drift_order=drift_order,
+        hrf_peak=hrf_peak,
+        hrf_undershoot=hrf_undershoot,
+        post_glm_pca_components=post_glm_pca_components,
         log_sigma_min=log_sigma_min,
         log_sigma_max=log_sigma_max,
         min_length_scale=min_length_scale,
@@ -455,6 +630,8 @@ def fit(
         validation_fraction=validation_fraction,
         validation_chunk_size=validation_chunk_size,
         validation_mode=validation_mode,
+        two_pass=two_pass,
+        nu=nu,
     )
     with open(output / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -529,6 +706,22 @@ def fit(
         )
         typer.echo(f"                       on {val_metrics['n_val_timepoints']} held-out (channel × timepoint) cells")
 
+    # Functional connectivity on the GP's denoised latent E[z|Y] — model output.
+    iu = np.triu_indices(n_channels, k=1)
+    fc_d = fc_pearson_denoised[iu]
+    fc_y = fc_pearson_data[iu]
+    typer.echo(
+        f"  FC (Pearson r on E[z|Y], denoised): mean |r|={float(np.mean(np.abs(fc_d))):.4f}    "
+        f"median |r|={float(np.median(np.abs(fc_d))):.4f}    "
+        f"max |r|={float(np.max(np.abs(fc_d))):.4f}    "
+        f"signed mean r={float(np.mean(fc_d)):+.4f}"
+    )
+    typer.echo(
+        f"  FC (Pearson r on raw Y, comparison): mean |r|={float(np.mean(np.abs(fc_y))):.4f}    "
+        f"median |r|={float(np.median(np.abs(fc_y))):.4f}    "
+        f"max |r|={float(np.max(np.abs(fc_y))):.4f}"
+    )
+
     if seed_channel_index is not None:
         if 0 <= seed_channel_index < n_channels:
             seed_label = str(ch_labels[seed_channel_index])
@@ -536,13 +729,35 @@ def fit(
             row_model = res['correlation'][seed_channel_index]
             row_resid = np.corrcoef(Y - res['posterior_mean'])[seed_channel_index]
 
-            functional_connectivity_score = (np.sum(res['correlation'][seed_channel_index]) - 1.0) / (n_channels - 1)
-            mean_correlation = (0.5 * (res['correlation'][seed_channel_index].sum() - n_channels))/(n_channels - 1)**2
+            functional_connectivity_score = (np.sum(res['correlation'][:, seed_channel_index]) - 1.0) / (n_channels - 1)
+            mean_correlation = (0.5 * (res['correlation'][:, seed_channel_index].sum() - n_channels))/(n_channels - 1)**2
 
             mask = np.arange(n_channels) != seed_channel_index
             typer.echo(f"  Seed channel:    row {seed_channel_index} ({seed_label})")
-            typer.echo(f"    functional connectivity score: {functional_connectivity_score:.4f}")
+            typer.echo(f"    functional connectivity score: {functional_connectivity_score:.4f} (raw: {np.sum(res['correlation'][:, seed_channel_index])})")
+            typer.echo(f"    max correlation: {np.sum(res['correlation'][mask, seed_channel_index].max()):.4f}")
+            typer.echo(f"    min correlation: {np.sum(res['correlation'][mask, seed_channel_index].min()):.4f}")
             typer.echo(f"    mean correlation: {mean_correlation:.4f}")
+
+            # K physically closest channels (3D midpoints).
+            seed_pos = positions_3d[seed_channel_index]
+            distances = np.linalg.norm(positions_3d - seed_pos[None, :], axis=1)
+            distances[seed_channel_index] = np.inf  # exclude self
+            k = max(1, min(int(seed_k_neighbors), n_channels - 1))
+            nearest = np.argsort(distances)[:k]
+            nearest_labels = [str(ch_labels[i]) for i in nearest]
+            nearest_dist = distances[nearest]
+            data_max = float(np.max(np.abs(row_data[nearest])))
+            model_max = float(np.max(np.abs(row_model[nearest])))
+            resid_max = float(np.max(np.abs(row_resid[nearest])))
+            typer.echo(
+                f"    K={k} closest channels (dist mm: {', '.join(f'{d:.1f}' for d in nearest_dist)}): "
+                f"{', '.join(nearest_labels)}"
+            )
+            typer.echo(
+                f"    max |corr| over K closest:  data={data_max:.4f}    model={model_max:.4f}    resid={resid_max:.4f}"
+            )
+
         else:
             typer.echo(f"  Seed channel index {seed_channel_index} out of range (0..{n_channels - 1}); skipping.")
 
@@ -641,6 +856,266 @@ def plot(
     """Visualise a fitted Whittle GP model."""
     fig_dir = output if output else model_dir / "figures"
     _generate_plots(model_dir, fig_dir)
+
+
+@app.command()
+def preprocess(
+    data: Path = typer.Argument(..., help="Path to a raw .snirf or .lob file"),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o",
+        help="Output .snirf path. Default for .snirf input: overwrite the input. Required for .lob input.",
+    ),
+    tddr: bool = typer.Option(True, "--tddr/--no-tddr", help="Apply TDDR motion correction (Fishburn 2019)."),
+    bandpass: bool = typer.Option(True, "--bandpass/--no-bandpass", help="Apply Butterworth bandpass filter."),
+    wavelet: bool = typer.Option(True, "--wavelet/--no-wavelet", help="Apply wavelet MAD-thresholding spike removal."),
+    hampel: bool = typer.Option(True, "--hampel/--no-hampel", help="Apply Hampel time-domain outlier filter (sample-wise spike removal)."),
+    bandpass_low_hz: float = typer.Option(0.009, "--bandpass-low-hz", help="High-pass cutoff (Hz) of the bandpass."),
+    bandpass_high_hz: float = typer.Option(0.08, "--bandpass-high-hz", help="Low-pass cutoff (Hz) of the bandpass."),
+    wavelet_iqr: float = typer.Option(1.5, "--wavelet-iqr", help="MAD-σ multiplier for wavelet spike thresholding (effective k = 2 × this)."),
+    hampel_window: int = typer.Option(7, "--hampel-window", help="Hampel filter half-window size (samples)."),
+    hampel_k: float = typer.Option(4.0, "--hampel-k", help="Hampel rejection threshold in robust σ units (k=4 ≈ 99.99%-conservative)."),
+    ppf_w1: float = typer.Option(6.0, "--ppf-w1", help="Partial pathlength factor at wavelength 1."),
+    ppf_w2: float = typer.Option(6.0, "--ppf-w2", help="Partial pathlength factor at wavelength 2."),
+    input_label: Optional[str] = typer.Option(
+        None, "--input-label",
+        help="Filter input to channels with this data_type_label. If omitted, auto-detect: pick the label whose channels span all wavelength indices.",
+    ),
+):
+    """Preprocess a raw fNIRS file (.snirf or .lob): TDDR + bandpass + wavelet
+    despike on intensity, then convert to optical density and HbO/HbR
+    concentrations via Modified Beer-Lambert. Writes the result as SNIRF.
+    """
+    import numpy as np
+
+    from fnirs.io import load_snirf_data, load_lob_data, save_concentration_snirf
+    from fnirs.preprocess import (
+        preprocess_optical_density, intensity_to_od, od_to_concentration,
+    )
+
+    suffix = data.suffix.lower()
+    if suffix == ".snirf":
+        if output is None:
+            output = data
+        nirs_data = load_snirf_data(str(data))
+    elif suffix == ".lob":
+        if output is None:
+            raise typer.BadParameter(
+                "--output is required for .lob input (we don't write back to .lob format)."
+            )
+        nirs_data = load_lob_data(str(data))
+    else:
+        raise typer.BadParameter(f"expected .snirf or .lob input; got {data.suffix}")
+
+    n_wavelengths = len(np.asarray(nirs_data.probe.wavelengths))
+    if input_label is None:
+        # Auto-detect: pick the label whose channels span every wavelength index.
+        from collections import defaultdict
+        by_label = defaultdict(list)
+        for ch in nirs_data.channels:
+            by_label[ch.measurement_info.data_type_label].append(ch)
+        expected = set(range(1, n_wavelengths + 1))
+        candidates = []
+        for label, chs in by_label.items():
+            wav_set = {ch.measurement_info.wavelength_index for ch in chs}
+            if expected.issubset(wav_set):
+                candidates.append((label, len(chs)))
+        if not candidates:
+            avail = sorted(by_label.keys())
+            raise typer.BadParameter(
+                f"Auto-detect failed: no data_type_label has channels at all wavelength indices "
+                f"{sorted(expected)}. Available labels: {avail}. Pass --input-label explicitly."
+            )
+        # Most channels wins; tie-break on label string for determinism.
+        candidates.sort(key=lambda x: (-x[1], x[0]))
+        input_label = candidates[0][0]
+        typer.echo(f"Auto-detected input label: {input_label!r} (from {sorted(by_label.keys())}).")
+
+    raw_channels = [ch for ch in nirs_data.channels if ch.measurement_info.data_type_label == input_label]
+    if not raw_channels:
+        avail = sorted({ch.measurement_info.data_type_label for ch in nirs_data.channels})
+        raise typer.BadParameter(
+            f"No channels with data_type_label={input_label!r}. Available: {avail}"
+        )
+    raw_idx = np.array([ch.channel_idx for ch in raw_channels])
+    typer.echo(f"Filtering to {len(raw_idx)} {input_label!r} channels (out of {len(nirs_data.channels)} total).")
+
+    intensity_t_x_c = nirs_data.time_series[:, raw_idx]   # (n_t, n_raw_ch)
+    n_t, n_ch = intensity_t_x_c.shape
+    time = np.asarray(nirs_data.time)
+    if len(time) >= 2:
+        fs = float(1.0 / np.median(np.diff(time)))
+    else:
+        fs = 1.0
+    typer.echo(f"Loaded {data.name}: {n_ch} channels, {n_t} timepoints, fs ≈ {fs:.3f} Hz.")
+
+    # Per-channel preprocessing in OD space (standard Homer / MNE-NIRS ordering).
+    intensity = intensity_t_x_c.T.astype(np.float64)
+    od_raw = intensity_to_od(intensity)
+    typer.echo(
+        f"  TDDR={tddr}  hampel={hampel} (w={hampel_window} k={hampel_k})  "
+        f"wavelet={wavelet} (k_robσ={2*wavelet_iqr:.1f})  "
+        f"bandpass={bandpass} [{bandpass_low_hz}, {bandpass_high_hz}] Hz"
+    )
+    od = preprocess_optical_density(
+        od_raw, fs,
+        apply_tddr=tddr,
+        apply_bandpass=bandpass,
+        apply_wavelet=wavelet,
+        apply_hampel=hampel,
+        bandpass_low_hz=bandpass_low_hz,
+        bandpass_high_hz=bandpass_high_hz,
+        wavelet_iqr_threshold=wavelet_iqr,
+        hampel_window=hampel_window,
+        hampel_k=hampel_k,
+    )
+
+    # Modified Beer-Lambert → HbO, HbR per source-detector pair (filtered set).
+    src_idx = np.array([ch.measurement_info.source_index for ch in raw_channels])
+    det_idx = np.array([ch.measurement_info.detector_index for ch in raw_channels])
+    wav_idx = np.array([ch.measurement_info.wavelength_index for ch in raw_channels])
+    distances = np.array([ch.distance for ch in raw_channels])
+    spatial_unit = (nirs_data.metadata.get("LengthUnit", "mm") if nirs_data.metadata else "mm")
+    if isinstance(spatial_unit, (bytes, np.bytes_)):
+        spatial_unit = spatial_unit.decode("utf-8")
+    spatial_unit = str(spatial_unit).lower().strip()
+
+    hbo, hbr, pair_keys, pair_distance = od_to_concentration(
+        od, src_idx, det_idx, wav_idx,
+        wavelengths=np.asarray(nirs_data.probe.wavelengths),
+        distances=distances,
+        ppf=(ppf_w1, ppf_w2),
+        spatial_unit=spatial_unit if spatial_unit in ("mm", "cm") else "mm",
+    )
+    # Standard fNIRS reporting unit is micromolar (μM = 10⁻⁶ M).
+    hbo *= 1e6
+    hbr *= 1e6
+    typer.echo(f"  Computed HbO/HbR for {len(pair_keys)} source-detector pairs (units: μM).")
+
+    # Pack output: HbO channels, then HbR channels (each pair contributes 2).
+    n_pairs = len(pair_keys)
+    out_time_series = np.zeros((n_t, 2 * n_pairs), dtype=np.float64)
+    measurement_list = []
+    for p_idx, (s, d) in enumerate(pair_keys):
+        out_time_series[:, p_idx] = hbo[p_idx]
+        measurement_list.append({
+            "sourceIndex": s, "detectorIndex": d, "wavelengthIndex": 1,
+            "dataType": 2, "dataTypeIndex": 1, "dataTypeLabel": "HbO",
+            "dataUnit": "uM",
+        })
+    for p_idx, (s, d) in enumerate(pair_keys):
+        out_time_series[:, n_pairs + p_idx] = hbr[p_idx]
+        measurement_list.append({
+            "sourceIndex": s, "detectorIndex": d, "wavelengthIndex": 1,
+            "dataType": 2, "dataTypeIndex": 2, "dataTypeLabel": "HbR",
+            "dataUnit": "uM",
+        })
+
+    save_concentration_snirf(
+        output, template=nirs_data, time_series=out_time_series,
+        measurement_list=measurement_list,
+        metadata_extra={
+            "preprocessing": (
+                f"fnirs preprocess: tddr={tddr} bandpass={bandpass}({bandpass_low_hz},{bandpass_high_hz}) "
+                f"wavelet={wavelet}(IQR={wavelet_iqr}) ppf={ppf_w1},{ppf_w2}"
+            ),
+        },
+    )
+    typer.echo(f"Saved {output}: {2 * n_pairs} channels (HbO + HbR), {n_t} timepoints.")
+
+
+@app.command()
+def montage(
+    data: Path = typer.Argument(..., help="Path to a .snirf or .lob file with HbO/HbR channels"),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o",
+        help="Output PNG path. Default: <input_stem>_montage_<chromophore>_<metric>.png alongside the input.",
+    ),
+    chromophore: str = typer.Option("hbo", "--chromophore", help="hbo, hbr, or hbt — which channels to summarise."),
+    metric: str = typer.Option(
+        "std", "--metric",
+        help="Per-channel scalar to plot: std, var, rms, max, peak-to-peak.",
+    ),
+    include_short_channels: bool = typer.Option(
+        False, "--include-short-channels",
+        help="Include short-separation channels (default: excluded).",
+    ),
+    log_scale: bool = typer.Option(False, "--log-scale", help="Plot log10(metric)."),
+    cmap: str = typer.Option("viridis", "--cmap", help="Matplotlib colormap name."),
+):
+    """Topographic montage: per-channel signal-summary scalar drawn as colour at
+    each channel's midpoint, overlaid on a head outline with sources (red) and
+    detectors (blue) labelled. Useful for visualising per-channel signal
+    properties to compare against external plots.
+    """
+    import numpy as np
+
+    from fnirs.io import load_snirf_data, load_lob_data
+    from fnirs.plotting import plot_montage_metric
+
+    suffix = data.suffix.lower()
+    if suffix == ".snirf":
+        nd = load_snirf_data(str(data))
+    elif suffix == ".lob":
+        nd = load_lob_data(str(data))
+    else:
+        raise typer.BadParameter(f"expected .snirf or .lob input; got {data.suffix}")
+
+    label_map = {"hbo": "HbO", "hbr": "HbR", "hbt": "HbT"}
+    target_label = label_map.get(chromophore.lower())
+    if target_label is None:
+        raise typer.BadParameter(f"chromophore must be hbo/hbr/hbt; got {chromophore!r}")
+
+    selected = [ch for ch in nd.channels if ch.measurement_info.data_type_label == target_label]
+    if not selected:
+        avail = sorted({ch.measurement_info.data_type_label for ch in nd.channels})
+        raise typer.BadParameter(
+            f"No channels labelled {target_label!r}. Available: {avail}"
+        )
+    if not include_short_channels:
+        selected = [ch for ch in selected if not ch.is_short_separation]
+        if not selected:
+            raise typer.BadParameter(
+                f"All {target_label} channels are short-separation; pass --include-short-channels."
+            )
+
+    ch_idx = np.array([ch.channel_idx for ch in selected])
+    Y = nd.time_series[:, ch_idx].T.astype(np.float64)  # (n_ch, n_t)
+
+    metric_funcs = {
+        "std": lambda Y: np.std(Y, axis=1),
+        "var": lambda Y: np.var(Y, axis=1),
+        "rms": lambda Y: np.sqrt(np.mean(Y ** 2, axis=1)),
+        "max": lambda Y: np.max(np.abs(Y), axis=1),
+        "peak-to-peak": lambda Y: np.ptp(Y, axis=1),
+    }
+    if metric not in metric_funcs:
+        raise typer.BadParameter(f"metric must be one of {sorted(metric_funcs)}; got {metric!r}")
+    values = metric_funcs[metric](Y)
+
+    midpoints = np.array([ch.midpoint_2d for ch in selected])
+    source_pos = np.array([ch.source_pos_2d for ch in selected])
+    det_pos = np.array([ch.detector_pos_2d for ch in selected])
+    src_indices = np.array([ch.measurement_info.source_index for ch in selected])
+    det_indices = np.array([ch.measurement_info.detector_index for ch in selected])
+    channel_labels = np.array([
+        f"S{ch.measurement_info.source_index}-D{ch.measurement_info.detector_index}"
+        for ch in selected
+    ])
+
+    if output is None:
+        output = data.with_name(f"{data.stem}_montage_{chromophore.lower()}_{metric}.png")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    plot_montage_metric(
+        midpoints, source_pos, det_pos, src_indices, det_indices, values,
+        channel_labels, output,
+        metric_name=f"{target_label} {metric}",
+        title=f"{data.name} — {target_label} {metric}  ({len(selected)} channels)",
+        cmap=cmap, log_scale=log_scale,
+    )
+    typer.echo(f"Saved {output}")
+    typer.echo(f"  metric={metric!r}  chromophore={target_label}  channels={len(selected)}  "
+               f"value range: [{float(values.min()):.3e}, {float(values.max()):.3e}]")
 
 
 @app.command()

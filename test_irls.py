@@ -72,7 +72,7 @@ class TestIRLS:
             d["max_spherical_degree"], d["n_fourier_components"],
             estimate_noise=False,
         )
-        X, f, A, ST, terms, noise_variance, n_iter = result
+        X, f, A, ST, terms, noise_variance, n_iter, _ = result
         assert noise_variance is None
         assert n_iter == 0
         # Check predictions work
@@ -94,7 +94,7 @@ class TestIRLS:
             max_irls_iter=30,
             irls_tol=1e-6,
         )
-        X, f, A, ST, terms, noise_variance, n_iter = result
+        X, f, A, ST, terms, noise_variance, n_iter, _ = result
         assert noise_variance is not None
         assert n_iter > 0
 
@@ -129,7 +129,7 @@ class TestIRLS:
         Y_hat_uw = f_uw(X_uw)
 
         # Weighted fit
-        X_w, f_w, _, _, _, noise_var, _ = fit(
+        X_w, f_w, _, _, _, noise_var, _, _ = fit(
             d["t"], d["theta"], d["phi"], d["Y"],
             d["max_spherical_degree"], d["n_fourier_components"],
             estimate_noise=True,
@@ -156,11 +156,11 @@ class TestIRLS:
             max_irls_iter=50,
             irls_tol=1e-4,
         )
-        _, _, _, _, _, _, n_iter = result
+        _, _, _, _, _, _, n_iter, _ = result
         assert n_iter < 50, f"IRLS did not converge in 50 iterations (used {n_iter})"
 
     def test_return_tuple_length(self):
-        """Return tuple should always have 7 elements."""
+        """Return tuple should always have 8 elements."""
         d = _make_synthetic_data()
 
         result_off = fit(
@@ -168,7 +168,7 @@ class TestIRLS:
             d["max_spherical_degree"], d["n_fourier_components"],
             estimate_noise=False,
         )
-        assert len(result_off) == 7
+        assert len(result_off) == 8
 
         result_on = fit(
             d["t"], d["theta"], d["phi"], d["Y"],
@@ -176,4 +176,4 @@ class TestIRLS:
             estimate_noise=True,
             max_irls_iter=3,
         )
-        assert len(result_on) == 7
+        assert len(result_on) == 8

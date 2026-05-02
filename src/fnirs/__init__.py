@@ -2,9 +2,13 @@
 fNIRS data analysis package for spatial-temporal modeling of hemodynamic responses.
 """
 
+import jax
+jax.config.update("jax_enable_x64", True)
+
 from .io import (
     load_snirf_data,
     load_hemodynamic_data,
+    load_lob_data,
     NIRSData,
     HemodynamicData,
     FNIRSChannel,
@@ -50,6 +54,7 @@ __all__ = [
     # IO
     "load_snirf_data",
     "load_hemodynamic_data",
+    "load_lob_data",
     "NIRSData",
     "HemodynamicData",
     "FNIRSChannel",

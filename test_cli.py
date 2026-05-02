@@ -23,21 +23,48 @@ def test_main_help():
     assert result.exit_code == 0
     assert "fit" in result.output
     assert "plot" in result.output
+    assert "explore" in result.output
+    assert "gs" in result.output
+
+
+def test_gs_help():
+    result = runner.invoke(app, ["gs", "--help"])
+    assert result.exit_code == 0
+    assert "DATA" in result.output
+    assert "OUTPUT" in result.output
+    assert "--max-irls-iter" in result.output
+    assert "--kernel-lengthscale" in result.output
 
 
 def test_fit_help():
     result = runner.invoke(app, ["fit", "--help"])
     assert result.exit_code == 0
-    assert "--data" in result.output
+    assert "DATA" in result.output
+    assert "OUTPUT" in result.output
     assert "--max-degree" in result.output
     assert "--estimate-noise" in result.output
+    assert "--no-plots" in result.output
 
 
 def test_plot_help():
     result = runner.invoke(app, ["plot", "--help"])
     assert result.exit_code == 0
-    assert "--model-dir" in result.output
-    assert "--data" in result.output
+    assert "MODEL_DIR" in result.output
+    assert "--data" not in result.output
+
+
+def test_interact_help():
+    result = runner.invoke(app, ["interact", "--help"])
+    assert result.exit_code == 0
+    assert "MODEL_DIR" in result.output
+
+
+def test_explore_help():
+    result = runner.invoke(app, ["explore", "--help"])
+    assert result.exit_code == 0
+    assert "DATA" in result.output
+    assert "--output" in result.output
+    assert "--chromophore" in result.output
 
 
 def _make_synthetic_model(tmp_path: Path, with_noise: bool = False):
@@ -112,8 +139,47 @@ def test_plot_spatial_snapshot(tmp_path):
 def test_plot_subcommand_with_synthetic(tmp_path):
     """Test the plot subcommand end-to-end with synthetic data."""
     _make_synthetic_model(tmp_path, with_noise=True)
-    result = runner.invoke(app, ["plot", "--model-dir", str(tmp_path)])
+    result = runner.invoke(app, ["plot", str(tmp_path)])
     assert result.exit_code == 0
     assert (tmp_path / "figures" / "harmonics_timeseries.png").exists()
     assert (tmp_path / "figures" / "noise_variance.png").exists()
-    assert (tmp_path / "figures" / "spatial_snapshot.png").exists()
+    # spatial_snapshot temporarily disabled in _run_plots
+    assert not (tmp_path / "figures" / "spatial_snapshot.png").exists()
+
+
+_LOB_SESSION1 = Path(__file__).parent / "data" / "Session1.lob"
+
+
+@pytest.mark.skipif(not _LOB_SESSION1.exists(), reason="Session1.lob not present")
+def test_load_lob_data_session1():
+    """Load .lob file and verify SNIRF-style API contract."""
+    from fnirs.io import load_lob_data, NIRSData
+
+    nd = load_lob_data(_LOB_SESSION1)
+    assert isinstance(nd, NIRSData)
+    assert nd.time_series.shape[0] == nd.time.shape[0]
+    assert nd.time_series.shape[1] == len(nd.channels)
+    hbo = nd.get_channels_by_data_type_label("HbO")
+    hbr = nd.get_channels_by_data_type_label("HbR")
+    assert len(hbo) > 0 and len(hbr) > 0
+    assert len(hbo) == len(hbr)  # one of each per source-detector pair
+    coords3d = nd.get_spatial_coordinates_3d()
+    assert coords3d is not None and coords3d.shape == (len(nd.channels), 3)
+    coords2d = nd.get_spatial_coordinates_2d()
+    assert coords2d.shape == (len(nd.channels), 2)
+    # Some channels should be flagged short-separation (rig has 8mm pairs)
+    assert any(ch.is_short_separation for ch in nd.channels)
+
+
+@pytest.mark.skipif(not _LOB_SESSION1.exists(), reason="Session1.lob not present")
+def test_fit_lob_smoke(tmp_path):
+    """`fnirs fit` runs end-to-end on a .lob file."""
+    out = tmp_path / "lob_fit"
+    result = runner.invoke(
+        app,
+        ["fit", str(_LOB_SESSION1), str(out), "--no-plots", "--max-degree", "2"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Selected" in result.output and "HbO" in result.output
+    assert (out / "model.npz").exists()
+    assert (out / "config.json").exists()

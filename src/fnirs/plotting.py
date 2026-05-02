@@ -6,8 +6,6 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
@@ -51,6 +49,63 @@ def plot_harmonics_timeseries(
     plt.close(fig)
 
 
+def _load_data_for_plot(data_path: Path, config: dict, short_pca_basis: Optional[np.ndarray] = None):
+    """Load (Y, time) honoring the chromophore filter recorded in config.
+
+    If config["_short_pca_basis"] (k, n_t) is set or short_pca_basis is passed,
+    regress those components out of Y to mirror what was done at fit time.
+    """
+    if short_pca_basis is None:
+        short_pca_basis = config.get("_short_pca_basis", None)
+    from fnirs.io import load_hemodynamic_data, load_snirf_data, load_lob_data, ChromophoreType
+
+    chrom_str = config.get("chromophore", "hbo").lower()
+    suffix = Path(data_path).suffix
+    if suffix in (".snirf", ".lob"):
+        nirs_data = load_snirf_data(str(data_path)) if suffix == ".snirf" else load_lob_data(str(data_path))
+        label_map = {"hbo": "HbO", "hbr": "HbR", "hbt": "HbT"}
+        target_label = label_map.get(chrom_str)
+        if target_label is None:
+            raise ValueError(f"Unknown chromophore in config: {chrom_str!r}")
+        selected = nirs_data.get_channels_by_data_type_label(target_label)
+        if not selected:
+            available = sorted({ch.measurement_info.data_type_label for ch in nirs_data.channels})
+            raise ValueError(
+                f"No channels with data_type_label={target_label!r} in {data_path}. "
+                f"Available: {available}"
+            )
+        if not config.get("include_short_channels", False):
+            selected = [ch for ch in selected if not ch.is_short_separation]
+        ch_indices = np.array([ch.channel_idx for ch in selected])
+        Y = nirs_data.time_series[:, ch_indices].T
+        time = np.asarray(nirs_data.time)
+    else:
+        hemo_data = load_hemodynamic_data(str(data_path))
+        chrom_map = {"hbo": ChromophoreType.HbO, "hbr": ChromophoreType.HbR, "hbt": ChromophoreType.HbT}
+        chrom = chrom_map[chrom_str]
+        Y = hemo_data.get_concentration_matrix(chrom).T
+        time = np.asarray(hemo_data.time)
+
+    bp = config.get("bandpass")
+    if bp:
+        from fnirs.cli import _parse_bandpass, _apply_bandpass
+        low_hz, high_hz = _parse_bandpass(bp)
+        dt_plot = float(time[1] - time[0])
+        Y = _apply_bandpass(Y, dt_plot, low_hz, high_hz)
+
+    if short_pca_basis is not None and short_pca_basis.shape[1] == Y.shape[1]:
+        Y_c = Y - Y.mean(axis=1, keepdims=True)
+        beta = short_pca_basis @ Y_c.T  # (k, n_long)
+        Y = Y - beta.T @ short_pca_basis
+
+    if config.get("mav_scale", False):
+        mav = np.mean(np.abs(Y), axis=1, keepdims=True)
+        scale = np.where(mav > 0, mav, 1.0)
+        Y = Y / scale
+
+    return Y, time
+
+
 def plot_residuals(
     X_freq: np.ndarray,
     ST: np.ndarray,
@@ -60,17 +115,7 @@ def plot_residuals(
     output_path: Path,
 ):
     """Plot per-channel residual RMS."""
-    from fnirs.io import load_hemodynamic_data, load_snirf_data, ChromophoreType
-
-    # Load original data
-    if str(data_path).endswith(".snirf"):
-        nirs_data = load_snirf_data(str(data_path))
-        Y = nirs_data.time_series.T
-    else:
-        hemo_data = load_hemodynamic_data(str(data_path))
-        chrom_map = {"hbo": ChromophoreType.HbO, "hbr": ChromophoreType.HbR, "hbt": ChromophoreType.HbT}
-        chrom = chrom_map[config.get("chromophore", "hbo").lower()]
-        Y = hemo_data.get_concentration_matrix(chrom).T
+    Y, _ = _load_data_for_plot(data_path, config)
 
     # Predict
     pred_freq = ST @ X_freq
@@ -91,16 +136,220 @@ def plot_residuals(
     plt.close(fig)
 
 
+def plot_data_vs_fit(
+    X_freq: np.ndarray,
+    ST: np.ndarray,
+    n_timepoints: int,
+    data_path: Path,
+    config: dict,
+    output_path: Path,
+    noise_variance: Optional[np.ndarray] = None,
+    max_channels: Optional[int] = None,
+):
+    """Plot per-channel data signal vs model fit, with optional ±σ noise band."""
+    Y, time = _load_data_for_plot(data_path, config)
+
+    pred_freq = ST @ X_freq
+    Y_hat = np.fft.irfft(pred_freq, n=n_timepoints, axis=1)
+
+    Y = Y[:, :n_timepoints]
+    time = time[:n_timepoints]
+
+    n_channels = Y.shape[0]
+    if max_channels is not None and n_channels > max_channels:
+        channel_indices = np.linspace(0, n_channels - 1, max_channels, dtype=int)
+    else:
+        channel_indices = np.arange(n_channels)
+
+    n_show = len(channel_indices)
+    n_cols = int(np.ceil(np.sqrt(n_show)))
+    n_rows = int(np.ceil(n_show / n_cols))
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(3.2 * n_cols, 1.8 * n_rows),
+        sharex=True, squeeze=False,
+    )
+
+    sigma = np.sqrt(noise_variance) if noise_variance is not None else None
+    mse_per_ch = np.mean((Y - Y_hat) ** 2, axis=1)
+    var_per_ch = np.var(Y, axis=1)
+
+    for ax_idx, ch in enumerate(channel_indices):
+        ax = axes[ax_idx // n_cols, ax_idx % n_cols]
+        ax.plot(time, Y[ch], color="black", linewidth=0.8, alpha=0.9, label="data", zorder=1)
+        if sigma is not None:
+            ax.fill_between(
+                time,
+                Y_hat[ch] - sigma[ch],
+                Y_hat[ch] + sigma[ch],
+                color="C3", alpha=0.2, linewidth=0, label="±σ", zorder=2,
+            )
+        ax.plot(time, Y_hat[ch], color="C3", linewidth=1.0, linestyle="--", label="fit", zorder=3)
+        r2 = 1.0 - mse_per_ch[ch] / var_per_ch[ch] if var_per_ch[ch] > 0 else float("nan")
+        ax.set_title(f"ch {ch}: MSE={mse_per_ch[ch]:.2e}, R²={r2:.2f}", fontsize=7)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.3)
+
+    for ax_idx in range(n_show, n_rows * n_cols):
+        axes[ax_idx // n_cols, ax_idx % n_cols].axis("off")
+
+    axes[0, 0].legend(loc="upper right", fontsize=7)
+    fig.supxlabel("Time", fontsize=10)
+    fig.supylabel("Signal", fontsize=10)
+    fig.suptitle("Data vs Model Fit", fontsize=13)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_short_channel_pca(
+    Y_short: np.ndarray,
+    V_top: np.ndarray,
+    time: np.ndarray,
+    output_path: Path,
+):
+    """Three-panel diagnostic for short-channel PCA regression:
+    raw short-channel signals, the top-k eigenvector time courses, and the
+    short-channel residuals after removing those k components.
+    """
+    n_short = Y_short.shape[0]
+    k = V_top.shape[0]
+
+    Y_short_c = Y_short - Y_short.mean(axis=1, keepdims=True)
+    beta = V_top @ Y_short_c.T  # (k, n_short)
+    Y_short_resid = Y_short - beta.T @ V_top
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+
+    for c in range(n_short):
+        axes[0].plot(time, Y_short[c], linewidth=0.7, alpha=0.8, label=f"sh{c}")
+    axes[0].set_ylabel("Signal")
+    axes[0].set_title(f"Short channel data ({n_short} channels)")
+    axes[0].grid(True, alpha=0.3)
+    if n_short <= 20:
+        axes[0].legend(loc="upper right", fontsize=7, ncol=min(n_short, 5))
+
+    cmap = plt.cm.viridis
+    for j in range(k):
+        axes[1].plot(time, V_top[j], color=cmap(j / max(k - 1, 1)),
+                     linewidth=1.0, label=f"PC{j+1}")
+    axes[1].set_ylabel("Component")
+    axes[1].set_title(f"Top {k} PCA eigenvectors of centered short data")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(loc="upper right", fontsize=8, ncol=min(k, 6))
+
+    for c in range(n_short):
+        axes[2].plot(time, Y_short_resid[c], linewidth=0.7, alpha=0.8)
+    axes[2].set_xlabel("Time")
+    axes[2].set_ylabel("Residual")
+    axes[2].set_title(f"Short channel residuals after removing top-{k} components")
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_correlation_matrix(
+    X_freq: np.ndarray,
+    ST: np.ndarray,
+    n_timepoints: int,
+    data_path: Path,
+    config: dict,
+    output_path: Path,
+):
+    """Plot channel-channel correlation matrices for data, model fit, and residual."""
+    Y, _ = _load_data_for_plot(data_path, config)
+    Y = Y[:, :n_timepoints]
+
+    Y_hat = np.fft.irfft(ST @ X_freq, n=n_timepoints, axis=1)
+    R = Y - Y_hat
+
+    def _corr(M):
+        Mc = M - M.mean(axis=1, keepdims=True)
+        std = Mc.std(axis=1, keepdims=True)
+        std[std == 0] = 1.0
+        Mn = Mc / std
+        return (Mn @ Mn.T) / Mn.shape[1]
+
+    C_data = _corr(Y)
+    C_fit = _corr(Y_hat)
+    C_res = _corr(R)
+    n = Y.shape[0]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    for ax, C, title in zip(axes, [C_data, C_fit, C_res], ["Data", "Fit", "Residual"]):
+        im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+        ax.set_title(f"{title} (n={n})")
+        ax.set_xlabel("channel")
+    axes[0].set_ylabel("channel")
+    fig.colorbar(im, ax=axes, fraction=0.025, pad=0.04, label="corr")
+    fig.suptitle("Channel-Channel Correlation", fontsize=13)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_noise_variance_history(
+    noise_variance_history: np.ndarray,
+    output_path: Path,
+):
+    """Plot per-channel σ across IRLS iterations.
+
+    noise_variance_history has shape (n_iter+1, n_channels). Index 0 is the
+    OLS-init; subsequent rows are after each IRLS iteration.
+    """
+    sigma = np.sqrt(np.maximum(noise_variance_history, 0))
+    n_steps, n_channels = sigma.shape
+    iters = np.arange(n_steps)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Linear scale
+    ax = axes[0]
+    cmap = plt.cm.viridis
+    for c in range(n_channels):
+        ax.plot(iters, sigma[:, c], color=cmap(c / max(n_channels - 1, 1)),
+                linewidth=0.6, alpha=0.7)
+    ax.set_xlabel("IRLS iteration (0 = OLS init)")
+    ax.set_ylabel("σ (per channel)")
+    ax.set_title("Per-channel σ across IRLS iterations (linear)")
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(iters)
+
+    # Log scale — easier to see runaway
+    ax = axes[1]
+    sigma_pos = np.where(sigma > 0, sigma, np.nan)
+    for c in range(n_channels):
+        ax.plot(iters, sigma_pos[:, c], color=cmap(c / max(n_channels - 1, 1)),
+                linewidth=0.6, alpha=0.7)
+    ax.set_yscale("log")
+    ax.set_xlabel("IRLS iteration (0 = OLS init)")
+    ax.set_ylabel("σ (per channel, log)")
+    ax.set_title("Per-channel σ across IRLS iterations (log)")
+    ax.grid(True, alpha=0.3, which="both")
+    ax.set_xticks(iters)
+
+    fig.suptitle(f"IRLS noise σ trajectory ({n_channels} channels, {n_steps - 1} iterations)", fontsize=13)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_noise_variance(
     noise_variance: np.ndarray,
     output_path: Path,
 ):
     """Plot per-channel estimated noise variance (IRLS)."""
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.bar(range(len(noise_variance)), noise_variance, color="coral", alpha=0.8)
+    n = len(noise_variance)
+    fig, ax = plt.subplots(figsize=(max(10, 0.18 * n), 4))
+    ax.bar(range(n), noise_variance, color="coral", alpha=0.8)
     ax.set_xlabel("Channel")
     ax.set_ylabel("Noise Variance")
     ax.set_title("Per-Channel Estimated Noise Variance (IRLS)")
+    ax.set_xticks(range(n))
+    ax.set_xticklabels([str(i) for i in range(n)], rotation=90, fontsize=6)
+    ax.set_xlim(-0.5, n - 0.5)
     ax.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -116,16 +365,7 @@ def plot_power_spectrum(
     output_path: Path,
 ):
     """Plot average power spectrum of data vs model prediction."""
-    from fnirs.io import load_hemodynamic_data, load_snirf_data, ChromophoreType
-
-    if str(data_path).endswith(".snirf"):
-        nirs_data = load_snirf_data(str(data_path))
-        Y = nirs_data.time_series.T
-    else:
-        hemo_data = load_hemodynamic_data(str(data_path))
-        chrom_map = {"hbo": ChromophoreType.HbO, "hbr": ChromophoreType.HbR, "hbt": ChromophoreType.HbT}
-        chrom = chrom_map[config.get("chromophore", "hbo").lower()]
-        Y = hemo_data.get_concentration_matrix(chrom).T
+    Y, _ = _load_data_for_plot(data_path, config)
 
     # Data power spectrum
     Y_freq_data = np.fft.rfft(Y, axis=1)

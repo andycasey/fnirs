@@ -25,9 +25,11 @@ def fit(
     estimate_noise: bool = False,
     max_irls_iter: int = 20,
     irls_tol: float = 1e-4,
+    irls_var_clip_ratio: float = 100.0,
     temporal_kernel: Optional[str] = None,
     kernel_lengthscale: float = 1.0,
     kernel_variance: float = 1.0,
+    spatial_ridge: float = 0.0,
 ):
     """Fit a separable spatial-temporal model using FFT for the temporal dimension.
 
@@ -65,34 +67,59 @@ def fit(
     dt = float(t[1] - t[0])
     freqs = jnp.fft.rfftfreq(n_timepoints, d=dt)[:n_freq]
 
-    # Per-frequency regularization
+    # Per-frequency regularization. For a stationary GP with PSD S(f) sampled
+    # at spacing dt, E[|X_freq[k]|^2] = (N/(2 dt)) S(f_k) for interior bins,
+    # and (N/dt) S(f_k) for DC/Nyquist. The GP-prior precision is its inverse.
     if temporal_kernel is None:
         lambdas = jnp.zeros(n_freq)
     elif temporal_kernel == "matern12":
         psd = matern12_psd(freqs, kernel_lengthscale, kernel_variance)
-        lambdas = 1.0 / psd
+        lambdas = (2.0 * dt / n_timepoints) / psd
+        lambdas = lambdas.at[0].mul(0.5)
+        if n_timepoints % 2 == 0 and n_freq == n_freq_all:
+            lambdas = lambdas.at[-1].mul(0.5)
     else:
         raise ValueError(f"Unknown temporal kernel: {temporal_kernel!r}")
+
+    # Spatial ridge: add λ_spatial * I to ST^T ST in every frequency bin.
+    # Needed when channels cluster on a small patch of the sphere — the
+    # global SH basis becomes near-collinear there and ST^T ST is ill-conditioned.
+    if spatial_ridge > 0:
+        lambdas = lambdas + spatial_ridge
 
     n_spatial = ST.shape[1]
     eye = jnp.eye(n_spatial)
 
     def _solve_freq(ST_w, Y_freq_w):
-        """Solve spatial normal equations per frequency bin."""
-        lhs_base = ST_w.T @ ST_w
-        rhs = ST_w.T @ Y_freq_w  # (n_spatial, n_freq) complex
+        """Per-frequency-bin Tikhonov LS via lstsq on the augmented design.
 
-        def solve_one(rhs_k, lambda_k):
-            return jnp.linalg.solve(lhs_base + lambda_k * eye, rhs_k)
+        Avoids forming ST^T ST (which squares the condition number) — solves
+        argmin_X ||ST_w X - y_k||² + λ_k ||X||²  as
+        argmin_X ||[ST_w; sqrt(λ_k) I] X - [y_k; 0]||² via lstsq.
+        """
+        n_aug_rows = ST_w.shape[0] + n_spatial
 
-        return jax.vmap(solve_one, in_axes=(1, 0), out_axes=1)(rhs, lambdas)
+        def solve_one(y_k, lambda_k):
+            sqrt_l = jnp.sqrt(jnp.maximum(lambda_k, 0.0))
+            ST_aug = jnp.vstack([ST_w, sqrt_l * eye])
+            y_aug = jnp.concatenate([y_k, jnp.zeros(n_spatial, dtype=y_k.dtype)])
+            x, *_ = jnp.linalg.lstsq(ST_aug, y_aug, rcond=None)
+            return x
+
+        return jax.vmap(solve_one, in_axes=(1, 0), out_axes=1)(Y_freq_w, lambdas)
 
     def _predict(X_freq_full, ST_pred):
         pred_freq = ST_pred @ X_freq_full
         return jnp.fft.irfft(pred_freq, n=n_timepoints, axis=1)
 
+    print(f"Design matrix cond(ST): {np.linalg.cond(np.asarray(ST)):.2e}")
+    print(f"Number of parameters: {ST.shape[1]} spatial x {n_freq} temporal = {ST.shape[1] * n_freq}")
+    print(f"Number of data points: {Y_freq_trunc.size} {Y_freq_trunc.shape} (n_channels x n_freq)")
+
     if not estimate_noise:
         X_freq = _solve_freq(ST, Y_freq_trunc)
+
+        #raise a
 
         # Pad back to full frequency range if truncated
         if n_freq < n_freq_all:
@@ -105,22 +132,42 @@ def fit(
         def predict_fn(X):
             return _predict(X, ST)
 
-        return (X_freq_full, predict_fn, None, ST, terms, None, 0)
+        return (X_freq_full, predict_fn, None, ST, terms, None, 0, None)
     else:
-        noise_variance = jnp.ones(n_channels)
-        n_iter = 0
+        # Initialize from unweighted OLS residuals so the first weighted iteration
+        # starts from a sensible per-channel scale rather than uniform ones.
+        X_freq_init = _solve_freq(ST, Y_freq_trunc)
+        if n_freq < n_freq_all:
+            X_freq_full = jnp.zeros((n_spatial, n_freq_all), dtype=X_freq_init.dtype)
+            X_freq_full = X_freq_full.at[:, :n_freq].set(X_freq_init)
+        else:
+            X_freq_full = X_freq_init
+        noise_variance = jnp.mean((Y - _predict(X_freq_full, ST)) ** 2, axis=1)
 
+        # Per-iteration history, including the OLS-init at index 0.
+        noise_variance_history = [np.asarray(noise_variance)]
+
+        n_iter = 0
         for i in range(max_irls_iter):
             n_iter = i + 1
-            w = 1.0 / noise_variance
-            sqrt_w = jnp.sqrt(w)
+
+            # Clip variance to a bounded dynamic range around the median.
+            # Without this, IRLS treats unmodelable signal (channels the spherical
+            # harmonic basis can't represent) as "noise", downweights them to zero,
+            # and inflates their variance without bound. Clipping keeps weights
+            # within sqrt(clip_ratio) of each other and prevents that runaway.
+            median_var = jnp.median(noise_variance)
+            lo = median_var / irls_var_clip_ratio
+            hi = median_var * irls_var_clip_ratio
+            noise_variance_eff = jnp.clip(noise_variance, lo, hi)
+
+            sqrt_w = 1.0 / jnp.sqrt(noise_variance_eff)
 
             ST_w = ST * sqrt_w[:, None]
             Y_freq_w = Y_freq_trunc * sqrt_w[:, None]
 
             X_freq = _solve_freq(ST_w, Y_freq_w)
 
-            # Pad and compute prediction in time domain
             if n_freq < n_freq_all:
                 X_freq_full = jnp.zeros((n_spatial, n_freq_all), dtype=X_freq.dtype)
                 X_freq_full = X_freq_full.at[:, :n_freq].set(X_freq)
@@ -130,6 +177,8 @@ def fit(
             Y_hat = _predict(X_freq_full, ST)
             residuals = Y - Y_hat
             new_noise_variance = jnp.mean(residuals ** 2, axis=1)
+
+            noise_variance_history.append(np.asarray(new_noise_variance))
 
             rel_change = jnp.abs(new_noise_variance - noise_variance) / jnp.maximum(noise_variance, 1e-30)
             if jnp.max(rel_change) < irls_tol:
@@ -142,7 +191,8 @@ def fit(
         def predict_fn(X):
             return _predict(X, ST)
 
-        return (X_freq_full, predict_fn, None, ST, terms, noise_variance, n_iter)
+        noise_variance_history = np.stack(noise_variance_history, axis=0)
+        return (X_freq_full, predict_fn, None, ST, terms, noise_variance, n_iter, noise_variance_history)
 
 
 

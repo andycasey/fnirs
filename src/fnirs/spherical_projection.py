@@ -5,7 +5,6 @@ Functions for projecting 3D fNIRS coordinates onto a sphere for spherical harmon
 
 import numpy as np
 from typing import Tuple, Optional, Union
-import matplotlib.pyplot as plt
 
 def project_to_sphere(positions_3d: np.ndarray, 
                      center: Optional[np.ndarray] = None,
@@ -410,6 +409,7 @@ def visualize_spherical_projection(result: dict,
     title : str
         Plot title
     """
+    import matplotlib.pyplot as plt
     fig = plt.figure(figsize=(15, 5))
     
     # Original 3D positions

@@ -14,6 +14,9 @@ def fit(
     Y: jnp.ndarray,
     max_spherical_degree: int,
     n_fourier_components: int,
+    estimate_noise: bool = False,
+    max_irls_iter: int = 20,
+    irls_tol: float = 1e-4,
 ):
     assert Y.shape[1] == len(t), "Y must have shape (n_channels, n_samples)"
     assert Y.shape[0] == len(θ) == len(ϕ), "Y must have shape (n_channels, n_samples)"
@@ -30,14 +33,53 @@ def fit(
     AT = partial(fourier_rmatmat, *args)
 
     ATA = gram_diagonal(*args)
-    lhs = ST.T @ ST
-    rhs = ((AT(Y) @ ST) / ATA[:, None]).T
-    XT, *_ = jnp.linalg.lstsq(lhs, rhs, rcond=None)
 
-    @jax.jit
-    def f(X):
-        return (A(X) @ ST.T).T
-    return (XT.T, f, A, ST, terms)
+    def _solve(ST_w, Y_w):
+        lhs = ST_w.T @ ST_w
+        rhs = ((AT(Y_w) @ ST_w) / ATA[:, None]).T
+        XT, *_ = jnp.linalg.lstsq(lhs, rhs, rcond=None)
+        return XT
+
+    if not estimate_noise:
+        XT = _solve(ST, Y)
+
+        @jax.jit
+        def f(X):
+            return (A(X) @ ST.T).T
+        return (XT.T, f, A, ST, terms, None, 0)
+    else:
+        n_channels = Y.shape[0]
+        noise_variance = jnp.ones(n_channels)
+        n_iter = 0
+
+        for i in range(max_irls_iter):
+            n_iter = i + 1
+            w = 1.0 / noise_variance
+            sqrt_w = jnp.sqrt(w)
+
+            # Weight spatial basis and data by sqrt(w) per channel
+            ST_w = ST * sqrt_w[:, None]
+            Y_w = Y * sqrt_w[:, None]
+
+            XT = _solve(ST_w, Y_w)
+
+            # Compute residuals (in original, unweighted space)
+            Y_hat = (A(XT.T) @ ST.T).T  # (n_channels, n_timepoints)
+            residuals = Y - Y_hat
+            new_noise_variance = jnp.mean(residuals ** 2, axis=1)
+
+            # Convergence check
+            rel_change = jnp.abs(new_noise_variance - noise_variance) / jnp.maximum(noise_variance, 1e-30)
+            if jnp.max(rel_change) < irls_tol:
+                noise_variance = new_noise_variance
+                break
+
+            noise_variance = new_noise_variance
+
+        @jax.jit
+        def f(X):
+            return (A(X) @ ST.T).T
+        return (XT.T, f, A, ST, terms, noise_variance, n_iter)
 
 
 

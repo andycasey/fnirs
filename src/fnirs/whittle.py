@@ -253,7 +253,6 @@ def _init_params(N: int, r: int, init_length_scale: float, init_noise_std: float
     # doesn't dominate.
     s = init_noise_std / np.sqrt(max(r, 1))
     L0 = (s * rng.standard_normal((N, r))).astype(np.float64)
-    print(f"L0 shape: {L0.shape} {L0.size}")
     log_d0 = np.full(N, float(np.log((0.1 * init_noise_std) ** 2)), dtype=np.float64)
     log_sigma2 = np.full(N, float(np.log(init_noise_std**2)), dtype=np.float64)
     log_ell = np.array(np.log(init_length_scale), dtype=np.float64)

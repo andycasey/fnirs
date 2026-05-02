@@ -1,11 +1,12 @@
 """Preprocessing for raw fNIRS intensity data.
 
-Pipeline:
-    intensity ──▶ TDDR motion correction (optional)
-              ──▶ bandpass filter (optional)
-              ──▶ wavelet spike removal (optional)
-              ──▶ optical density (mandatory)
-              ──▶ HbO / HbR via Modified Beer-Lambert Law (mandatory)
+Pipeline (as implemented by `preprocess_optical_density`):
+    intensity ──▶ optical density (-log(|I|/mean|I|), per channel)
+              ──▶ TDDR motion correction (optional)
+              ──▶ Hampel sample-wise spike removal (optional)
+              ──▶ Wavelet detail-coefficient despiking (optional)
+              ──▶ Bandpass filter (optional, on OD)
+              ──▶ HbO / HbR via Modified Beer-Lambert Law (mandatory; unit μM)
 """
 from __future__ import annotations
 

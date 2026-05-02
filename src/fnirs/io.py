@@ -955,3 +955,172 @@ def load_hemodynamic_data(matlab_file_path: str) -> HemodynamicData:
     )
 
     return hemodynamic_data
+
+
+# ========================================================================
+# .lob format support (NIRSport / cw_nirs MATLAB MCOS object container)
+# ========================================================================
+
+# Prahl HbO/HbR molar extinction coefficients (cm^-1 / M) at 760 nm and 850 nm.
+# Source: https://omlc.org/spectra/hemoglobin/summary.html (Prahl, S.).
+_LOB_EXTINCTION_PER_CM_PER_M = {
+    760.0: (645.5, 1669.0),
+    850.0: (1097.0, 781.0),
+}
+
+# Default partial pathlength factor (DPF * PPF correction) per wavelength.
+# 6.0 is the conventional adult head value for both 760 and 850 nm (Scholkmann & Wolf 2013).
+_LOB_DEFAULT_PPF = 6.0
+
+
+def _read_lob_mcos_arr(lob_path: Union[str, Path]) -> np.ndarray:
+    """Extract the cw_nirs MCOS property cell array from a .lob file.
+
+    .lob files are MATLAB v5 .mat files that store a single MATLAB class
+    (cw_nirs) as an MCOS opaque object. scipy.io.loadmat exposes the raw
+    bytes as `__function_workspace__`; this routine parses them and returns
+    the 13-element property cell array.
+    """
+    import io as _io
+    from scipy.io import loadmat
+    from scipy.io.matlab._mio5 import MatFile5Reader
+
+    raw = loadmat(str(lob_path), squeeze_me=False, struct_as_record=True)
+    if "__function_workspace__" not in raw:
+        raise ValueError(f"{lob_path}: not an MCOS-style .lob file")
+    ws = raw["__function_workspace__"].tobytes()
+    fake = b"\x00" * 124 + b"\x00\x00IM" + ws
+    reader = MatFile5Reader(_io.BytesIO(fake))
+    reader.byte_order = "<"
+    reader.initialize_read()
+    reader.mat_stream.seek(128 + 8)
+    hdr, _ = reader.read_var_header()
+    top = reader.read_var_array(hdr, process=True)
+    return top["MCOS"][0, 0][0]["arr"]
+
+
+def load_lob_data(lob_file_path: Union[str, Path], ppf: float = _LOB_DEFAULT_PPF) -> NIRSData:
+    """Load a .lob (cw_nirs) fNIRS recording as NIRSData.
+
+    Raw intensity (`d`) is converted to ΔHbO / ΔHbR concentration via the
+    Modified Beer-Lambert Law and exposed as channels labelled `HbO` / `HbR`,
+    matching the SNIRF concentration-data conventions consumed downstream.
+    Channels with source-detector separation < 15 mm are flagged as
+    short-separation via FNIRSChannel.is_short_separation.
+    """
+    arr = _read_lob_mcos_arr(lob_file_path)
+    t = np.asarray(arr[2, 0]).flatten().astype(float)
+    d = np.asarray(arr[3, 0]).astype(float)               # (T, n_raw_channels)
+    sd = arr[6, 0][0, 0]
+    meas_list = np.asarray(sd["MeasList"]).astype(int)    # (n_raw, 4): src,det,_,wav_idx
+    wavelengths = np.asarray(sd["Lambda"]).flatten().astype(float)
+    src_pos_3d = np.asarray(sd["SrcPos"]).astype(float)   # (n_src, 3)
+    det_pos_3d = np.asarray(sd["DetPos"]).astype(float)   # (n_det, 3)
+    spatial_unit = "mm"
+    if "SpatialUnit" in sd.dtype.names:
+        try:
+            spatial_unit = str(np.asarray(sd["SpatialUnit"]).flatten()[0])
+        except Exception:
+            pass
+
+    # 2D positions: drop z (small relative to head curvature for visualization).
+    src_pos_2d = src_pos_3d[:, :2]
+    det_pos_2d = det_pos_3d[:, :2]
+
+    # Convert raw intensity → ΔOD per (src, det, wavelength) channel.
+    # ΔOD = -log(I / I_baseline); use mean intensity as baseline.
+    baseline = np.mean(d, axis=0)
+    baseline = np.where(baseline > 0, baseline, 1.0)
+    dod = -np.log(np.clip(d / baseline, 1e-12, None))
+
+    # Group raw channels by (src, det) pair; require both wavelengths to invert MBLL.
+    pair_to_indices: Dict[Tuple[int, int], Dict[int, int]] = {}
+    for raw_idx, row in enumerate(meas_list):
+        src, det, _gain, wav = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+        pair_to_indices.setdefault((src, det), {})[wav] = raw_idx
+
+    # Sanity-check we have the expected wavelengths (assumed 2: HbO/HbR-sensitive pair).
+    if len(wavelengths) != 2:
+        raise ValueError(f"{lob_file_path}: expected 2 wavelengths, got {wavelengths!r}")
+    eps_list = []
+    for w in wavelengths:
+        key = float(w)
+        if key not in _LOB_EXTINCTION_PER_CM_PER_M:
+            raise ValueError(
+                f"{lob_file_path}: no extinction coefficients for wavelength {w} nm; "
+                f"known: {sorted(_LOB_EXTINCTION_PER_CM_PER_M)}"
+            )
+        eps_list.append(_LOB_EXTINCTION_PER_CM_PER_M[key])
+    eps = np.array(eps_list)  # (n_wav, 2): rows=wavelengths, cols=[HbO, HbR]
+    # Convert to per-mm if positions are in mm (extinction coeffs above are per-cm).
+    eps_per_unit = eps / 10.0 if spatial_unit.lower() == "mm" else eps
+    eps_pinv = np.linalg.pinv(eps_per_unit)  # (2, n_wav)
+
+    # Build concentration channels (HbO, HbR) per (src, det) pair.
+    n_t = d.shape[0]
+    channels: List[FNIRSChannel] = []
+    conc_columns: List[np.ndarray] = []
+    chrom_labels = ("HbO", "HbR")
+    chrom_data_types = (DataType.CONC_HBO.value, DataType.CONC_HBR.value)
+
+    # Sort pairs by (src, det) for stable ordering.
+    for (src, det), wav_to_idx in sorted(pair_to_indices.items()):
+        if set(wav_to_idx.keys()) != {1, 2}:
+            # Skip pairs missing a wavelength; can't invert MBLL.
+            continue
+        rho = float(np.linalg.norm(src_pos_3d[src - 1] - det_pos_3d[det - 1]))
+        # Stack ΔOD for this pair: (T, n_wav)
+        dod_pair = np.stack([dod[:, wav_to_idx[w]] for w in (1, 2)], axis=1)
+        # ΔC = (1 / (rho * ppf)) * eps_pinv @ ΔOD.T  → shape (2, T)
+        if rho > 0:
+            dc_pair = (eps_pinv @ dod_pair.T) / (rho * ppf)
+        else:
+            dc_pair = np.zeros((2, n_t))
+
+        for chrom_idx, (label, dtype_val) in enumerate(zip(chrom_labels, chrom_data_types)):
+            wav = wavelengths[chrom_idx]  # nominal wavelength label (informational)
+            mi = MeasurementInfo(
+                source_index=src,
+                detector_index=det,
+                wavelength_index=chrom_idx + 1,
+                data_type=dtype_val,
+                data_type_index=1,
+                data_type_label=label,
+                wavelength=float(wav),
+                data_unit="M",
+            )
+            ch = FNIRSChannel(
+                channel_idx=len(channels),
+                measurement_info=mi,
+                source_pos_2d=src_pos_2d[src - 1],
+                detector_pos_2d=det_pos_2d[det - 1],
+                source_pos_3d=src_pos_3d[src - 1],
+                detector_pos_3d=det_pos_3d[det - 1],
+            )
+            channels.append(ch)
+            conc_columns.append(dc_pair[chrom_idx])
+
+    if not channels:
+        raise ValueError(f"{lob_file_path}: no source-detector pairs with both wavelengths")
+
+    time_series = np.stack(conc_columns, axis=1)  # (T, n_channels)
+
+    fs = 1.0 / float(np.mean(np.diff(t))) if len(t) > 1 else None
+    probe = ProbeInfo(
+        source_positions_2d=src_pos_2d,
+        detector_positions_2d=det_pos_2d,
+        source_positions_3d=src_pos_3d,
+        detector_positions_3d=det_pos_3d,
+        wavelengths=wavelengths,
+        frequency=fs,
+        length_unit=spatial_unit,
+    )
+
+    return NIRSData(
+        time_series=time_series,
+        time=t,
+        channels=channels,
+        probe=probe,
+        format_version="lob/cw_nirs",
+        metadata={"source_format": "lob", "ppf": ppf},
+    )

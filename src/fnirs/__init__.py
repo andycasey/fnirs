@@ -2,11 +2,15 @@
 fNIRS data analysis: spatio-temporal Whittle GP for connectivity estimation.
 """
 
+import jax
+jax.config.update("jax_enable_x64", True)
+
 from .io import (
     load_snirf_data,
     load_lob_data,
     load_nirs_data,
     load_hemodynamic_data,
+    load_lob_data,
     NIRSData,
     HemodynamicData,
     FNIRSChannel,
@@ -35,6 +39,7 @@ __all__ = [
     "load_lob_data",
     "load_nirs_data",
     "load_hemodynamic_data",
+    "load_lob_data",
     "NIRSData",
     "HemodynamicData",
     "FNIRSChannel",

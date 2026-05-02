@@ -6,20 +6,39 @@ from scipy.special import sph_harm_y
 from typing import List, Optional
 
 
-#@partial(jax.jit, static_argnames=("max_spherical_degree", "n_fourier_components"))
+def matern12_psd(freqs: jnp.ndarray, lengthscale: float, variance: float) -> jnp.ndarray:
+    """Matérn-1/2 (exponential kernel) power spectral density.
+
+    S(f) = 2σ²ℓ / (1 + (2πfℓ)²)
+    """
+    omega = 2 * jnp.pi * freqs
+    return 2 * variance * lengthscale / (1 + (lengthscale * omega) ** 2)
+
+
 def fit(
     t: jnp.array,
     θ: jnp.array,
     ϕ: jnp.array,
     Y: jnp.ndarray,
     max_spherical_degree: int,
-    n_fourier_components: int,
+    n_fourier_components: Optional[int] = None,
     estimate_noise: bool = False,
     max_irls_iter: int = 20,
     irls_tol: float = 1e-4,
+    temporal_kernel: Optional[str] = None,
+    kernel_lengthscale: float = 1.0,
+    kernel_variance: float = 1.0,
 ):
+    """Fit a separable spatial-temporal model using FFT for the temporal dimension.
+
+    Default behavior (estimate_noise=False, temporal_kernel=None) is unregularized
+    least squares — identical to the original implementation.
+    """
     assert Y.shape[1] == len(t), "Y must have shape (n_channels, n_samples)"
     assert Y.shape[0] == len(θ) == len(ϕ), "Y must have shape (n_channels, n_samples)"
+
+    n_channels, n_timepoints = Y.shape
+
     ST, terms = create_spherical_harmonics_basis(
         θ, ϕ, max_degree=max_spherical_degree
     )
@@ -28,27 +47,66 @@ def fit(
             f"Warning: number of spherical harmonics basis functions ({len(terms)}) exceeds number of channels ({len(θ)})."
         )
 
-    args = ((len(t), ), (n_fourier_components, ))
-    A = partial(fourier_matmat, *args)
-    AT = partial(fourier_rmatmat, *args)
+    ST = jnp.array(ST)
 
-    ATA = gram_diagonal(*args)
+    # FFT along time axis
+    Y_freq = jnp.fft.rfft(Y, axis=1)  # (n_channels, n_freq_bins)
+    n_freq_all = Y_freq.shape[1]
 
-    def _solve(ST_w, Y_w):
-        lhs = ST_w.T @ ST_w
-        rhs = ((AT(Y_w) @ ST_w) / ATA[:, None]).T
-        XT, *_ = jnp.linalg.lstsq(lhs, rhs, rcond=None)
-        return XT
+    # Determine how many frequency bins to use
+    if n_fourier_components is not None:
+        n_freq = min(n_fourier_components, n_freq_all)
+    else:
+        n_freq = n_freq_all
+
+    Y_freq_trunc = Y_freq[:, :n_freq]
+
+    # Frequency array
+    dt = float(t[1] - t[0])
+    freqs = jnp.fft.rfftfreq(n_timepoints, d=dt)[:n_freq]
+
+    # Per-frequency regularization
+    if temporal_kernel is None:
+        lambdas = jnp.zeros(n_freq)
+    elif temporal_kernel == "matern12":
+        psd = matern12_psd(freqs, kernel_lengthscale, kernel_variance)
+        lambdas = 1.0 / psd
+    else:
+        raise ValueError(f"Unknown temporal kernel: {temporal_kernel!r}")
+
+    n_spatial = ST.shape[1]
+    eye = jnp.eye(n_spatial)
+
+    def _solve_freq(ST_w, Y_freq_w):
+        """Solve spatial normal equations per frequency bin."""
+        lhs_base = ST_w.T @ ST_w
+        rhs = ST_w.T @ Y_freq_w  # (n_spatial, n_freq) complex
+
+        def solve_one(rhs_k, lambda_k):
+            return jnp.linalg.solve(lhs_base + lambda_k * eye, rhs_k)
+
+        return jax.vmap(solve_one, in_axes=(1, 0), out_axes=1)(rhs, lambdas)
+
+    def _predict(X_freq_full, ST_pred):
+        pred_freq = ST_pred @ X_freq_full
+        return jnp.fft.irfft(pred_freq, n=n_timepoints, axis=1)
 
     if not estimate_noise:
-        XT = _solve(ST, Y)
+        X_freq = _solve_freq(ST, Y_freq_trunc)
+
+        # Pad back to full frequency range if truncated
+        if n_freq < n_freq_all:
+            X_freq_full = jnp.zeros((n_spatial, n_freq_all), dtype=X_freq.dtype)
+            X_freq_full = X_freq_full.at[:, :n_freq].set(X_freq)
+        else:
+            X_freq_full = X_freq
 
         @jax.jit
-        def f(X):
-            return (A(X) @ ST.T).T
-        return (XT.T, f, A, ST, terms, None, 0)
+        def predict_fn(X):
+            return _predict(X, ST)
+
+        return (X_freq_full, predict_fn, None, ST, terms, None, 0)
     else:
-        n_channels = Y.shape[0]
         noise_variance = jnp.ones(n_channels)
         n_iter = 0
 
@@ -57,18 +115,22 @@ def fit(
             w = 1.0 / noise_variance
             sqrt_w = jnp.sqrt(w)
 
-            # Weight spatial basis and data by sqrt(w) per channel
             ST_w = ST * sqrt_w[:, None]
-            Y_w = Y * sqrt_w[:, None]
+            Y_freq_w = Y_freq_trunc * sqrt_w[:, None]
 
-            XT = _solve(ST_w, Y_w)
+            X_freq = _solve_freq(ST_w, Y_freq_w)
 
-            # Compute residuals (in original, unweighted space)
-            Y_hat = (A(XT.T) @ ST.T).T  # (n_channels, n_timepoints)
+            # Pad and compute prediction in time domain
+            if n_freq < n_freq_all:
+                X_freq_full = jnp.zeros((n_spatial, n_freq_all), dtype=X_freq.dtype)
+                X_freq_full = X_freq_full.at[:, :n_freq].set(X_freq)
+            else:
+                X_freq_full = X_freq
+
+            Y_hat = _predict(X_freq_full, ST)
             residuals = Y - Y_hat
             new_noise_variance = jnp.mean(residuals ** 2, axis=1)
 
-            # Convergence check
             rel_change = jnp.abs(new_noise_variance - noise_variance) / jnp.maximum(noise_variance, 1e-30)
             if jnp.max(rel_change) < irls_tol:
                 noise_variance = new_noise_variance
@@ -77,9 +139,10 @@ def fit(
             noise_variance = new_noise_variance
 
         @jax.jit
-        def f(X):
-            return (A(X) @ ST.T).T
-        return (XT.T, f, A, ST, terms, noise_variance, n_iter)
+        def predict_fn(X):
+            return _predict(X, ST)
+
+        return (X_freq_full, predict_fn, None, ST, terms, noise_variance, n_iter)
 
 
 

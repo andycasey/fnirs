@@ -446,6 +446,100 @@ def _read_lob_mcos_arr(lob_path: Union[str, Path]) -> np.ndarray:
     return top["MCOS"][0, 0][0]["arr"]
 
 
+def load_nirs_data(nirs_file_path: Union[str, Path]) -> NIRSData:
+    """Load a Homer-style .nirs (MATLAB v5) file as raw-intensity NIRSData.
+
+    The .nirs format is a flat .mat file with top-level fields:
+        t   : (T, 1) time vector
+        d   : (T, n_channels) raw intensity, channels in MeasList order
+        SD  : struct with MeasList (n_ch, 4: src, det, gain, wav_idx),
+              Lambda (1, n_wavelengths), SrcPos / DetPos (n×3),
+              nSrcs, nDets, SpatialUnit
+        s   : (T, n_conditions) stim onset markers (1 at onset, 0 elsewhere)
+        aux : optional auxiliary signals
+
+    Each (source, detector, wavelength) channel is exposed as one FNIRSChannel
+    with data_type_label 'RAW'; stim events come from the `s` matrix (each
+    non-zero sample becomes a unit-duration onset for that condition).
+    """
+    from scipy.io import loadmat
+
+    mat = loadmat(str(nirs_file_path), squeeze_me=False, struct_as_record=True)
+    if "d" not in mat or "SD" not in mat or "t" not in mat:
+        raise ValueError(f"{nirs_file_path}: not a Homer-style .nirs file (missing t/d/SD).")
+
+    d = np.asarray(mat["d"], dtype=float)                         # (T, n_ch)
+    t = np.asarray(mat["t"]).flatten().astype(float)              # (T,)
+    sd = mat["SD"][0, 0]
+    meas_list = np.asarray(sd["MeasList"]).astype(int)            # (n_ch, 4)
+    wavelengths = np.asarray(sd["Lambda"]).flatten().astype(float)
+    src_pos_3d = np.asarray(sd["SrcPos"]).astype(float)
+    det_pos_3d = np.asarray(sd["DetPos"]).astype(float)
+    spatial_unit = "mm"
+    if "SpatialUnit" in sd.dtype.names:
+        try:
+            spatial_unit = str(np.asarray(sd["SpatialUnit"]).flatten()[0])
+        except Exception:
+            pass
+    src_pos_2d = src_pos_3d[:, :2]
+    det_pos_2d = det_pos_3d[:, :2]
+
+    channels: List[FNIRSChannel] = []
+    for raw_idx, row in enumerate(meas_list):
+        src, det, _gain, wav = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+        wav_value = float(wavelengths[wav - 1]) if 1 <= wav <= len(wavelengths) else float("nan")
+        mi = MeasurementInfo(
+            source_index=src,
+            detector_index=det,
+            wavelength_index=wav,
+            data_type=DataType.RAW.value,
+            data_type_index=1,
+            data_type_label="RAW",
+            wavelength=wav_value,
+        )
+        channels.append(FNIRSChannel(
+            channel_idx=raw_idx,
+            measurement_info=mi,
+            source_pos_2d=src_pos_2d[src - 1],
+            detector_pos_2d=det_pos_2d[det - 1],
+            source_pos_3d=src_pos_3d[src - 1],
+            detector_pos_3d=det_pos_3d[det - 1],
+        ))
+
+    # Stim: Homer's `s` is (T, n_cond) with 1 at each event onset.
+    # Convert to one StimInfo per condition with [onset_t, duration=0, amp=1] rows.
+    stim_groups: List[StimInfo] = []
+    if "s" in mat:
+        s_mat = np.asarray(mat["s"]).astype(float)
+        if s_mat.ndim == 2:
+            for c in range(s_mat.shape[1]):
+                idx = np.where(s_mat[:, c] != 0)[0]
+                if idx.size == 0:
+                    continue
+                rows = np.column_stack([t[idx], np.zeros(len(idx)), s_mat[idx, c]])
+                stim_groups.append(StimInfo(name=str(c + 1), data=rows))
+
+    fs = 1.0 / float(np.mean(np.diff(t))) if len(t) > 1 else None
+    probe = ProbeInfo(
+        source_positions_2d=src_pos_2d,
+        detector_positions_2d=det_pos_2d,
+        source_positions_3d=src_pos_3d,
+        detector_positions_3d=det_pos_3d,
+        wavelengths=wavelengths,
+        frequency=fs,
+        length_unit=spatial_unit,
+    )
+    return NIRSData(
+        time_series=d,
+        time=t,
+        channels=channels,
+        probe=probe,
+        format_version="nirs/homer",
+        metadata={"source_format": "nirs", "LengthUnit": spatial_unit},
+        stimulus=stim_groups if stim_groups else None,
+    )
+
+
 def load_lob_data(lob_file_path: Union[str, Path]) -> NIRSData:
     """Load a .lob (cw_nirs) file as NIRSData with RAW intensity channels.
 

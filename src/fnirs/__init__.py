@@ -5,6 +5,7 @@ fNIRS data analysis: spatio-temporal Whittle GP for connectivity estimation.
 from .io import (
     load_snirf_data,
     load_lob_data,
+    load_nirs_data,
     load_hemodynamic_data,
     NIRSData,
     HemodynamicData,
@@ -32,6 +33,7 @@ __all__ = [
     # IO
     "load_snirf_data",
     "load_lob_data",
+    "load_nirs_data",
     "load_hemodynamic_data",
     "NIRSData",
     "HemodynamicData",

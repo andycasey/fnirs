@@ -967,10 +967,10 @@ def plot(
 
 @app.command()
 def preprocess(
-    data: Path = typer.Argument(..., help="Path to a raw .snirf or .lob file"),
+    data: Path = typer.Argument(..., help="Path to a raw .snirf, .lob, or .nirs file"),
     output: Optional[Path] = typer.Option(
         None, "--output", "-o",
-        help="Output .snirf path. Default for .snirf input: overwrite the input. Required for .lob input.",
+        help="Output .snirf path. Default for .snirf input: overwrite the input. Required for .lob and .nirs input.",
     ),
     tddr: bool = typer.Option(True, "--tddr/--no-tddr", help="Apply TDDR motion correction (Fishburn 2019)."),
     bandpass: bool = typer.Option(True, "--bandpass/--no-bandpass", help="Apply Butterworth bandpass filter."),
@@ -998,7 +998,7 @@ def preprocess(
     """
     import numpy as np
 
-    from fnirs.io import load_snirf_data, load_lob_data, save_concentration_snirf
+    from fnirs.io import load_snirf_data, load_lob_data, load_nirs_data, save_concentration_snirf
     from fnirs.preprocess import (
         preprocess_optical_density, intensity_to_od, od_to_concentration,
     )
@@ -1014,8 +1014,14 @@ def preprocess(
                 "--output is required for .lob input (we don't write back to .lob format)."
             )
         nirs_data = load_lob_data(str(data))
+    elif suffix == ".nirs":
+        if output is None:
+            raise typer.BadParameter(
+                "--output is required for .nirs input (we don't write back to .nirs format)."
+            )
+        nirs_data = load_nirs_data(str(data))
     else:
-        raise typer.BadParameter(f"expected .snirf or .lob input; got {data.suffix}")
+        raise typer.BadParameter(f"expected .snirf, .lob, or .nirs input; got {data.suffix}")
 
     n_wavelengths = len(np.asarray(nirs_data.probe.wavelengths))
     if input_label is None:

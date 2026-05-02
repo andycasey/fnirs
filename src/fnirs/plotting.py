@@ -1,454 +1,534 @@
-#!/usr/bin/env python3
-"""Plotting functions for fnirs model visualization."""
+"""Plotting functions for the Whittle GP model."""
+from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import List, Tuple, Optional
 
 import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def plot_harmonics_timeseries(
-    X_freq: np.ndarray,
-    terms: List[Tuple[int, int]],
-    n_timepoints: int,
+def plot_montage_metric(
+    midpoints: np.ndarray,
+    source_pos: np.ndarray,
+    detector_pos: np.ndarray,
+    src_indices: np.ndarray,
+    det_indices: np.ndarray,
+    values: np.ndarray,
+    channel_labels: np.ndarray | None,
     output_path: Path,
+    metric_name: str = "metric",
+    title: str | None = None,
+    cmap: str = "viridis",
+    log_scale: bool = False,
 ):
-    """Plot amplitude of each spherical harmonic component over time.
-
-    For each (l, m) pair, compute the time-domain signal via IRFFT.
-    Plot grouped by degree l with different colors per m.
+    """Topographic montage with per-channel scalar overlaid as colour at the
+    channel midpoint. Sources are red dots with index labels, detectors blue.
     """
-    max_l = max(t[0] for t in terms)
+    midpoints = np.asarray(midpoints)
+    source_pos = np.asarray(source_pos)
+    detector_pos = np.asarray(detector_pos)
+    values = np.asarray(values, dtype=float)
 
-    fig, axes = plt.subplots(max_l + 1, 1, figsize=(12, 3 * (max_l + 1)), sharex=True)
-    if max_l == 0:
-        axes = [axes]
+    # Unique source / detector positions, keyed by index for labels.
+    src_map: dict[int, np.ndarray] = {}
+    for idx, pos in zip(src_indices, source_pos):
+        src_map.setdefault(int(idx), pos)
+    det_map: dict[int, np.ndarray] = {}
+    for idx, pos in zip(det_indices, detector_pos):
+        det_map.setdefault(int(idx), pos)
+    src_idx_unique = np.array(sorted(src_map))
+    det_idx_unique = np.array(sorted(det_map))
+    src_unique = np.array([src_map[i] for i in src_idx_unique])
+    det_unique = np.array([det_map[i] for i in det_idx_unique])
 
-    cmap = plt.cm.tab10
+    all_pts = np.vstack([midpoints, src_unique, det_unique])
+    center = all_pts.mean(axis=0)
+    radius = float(np.max(np.linalg.norm(all_pts - center, axis=1))) * 1.15
 
-    for l_deg in range(max_l + 1):
-        ax = axes[l_deg]
-        m_values = [t[1] for t in terms if t[0] == l_deg]
-        indices = [i for i, t in enumerate(terms) if t[0] == l_deg]
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
 
-        for idx, (i, m) in enumerate(zip(indices, m_values)):
-            signal = np.fft.irfft(X_freq[i, :], n=n_timepoints)
-            color = cmap(idx % 10)
-            ax.plot(signal, color=color, label=f"m={m}", alpha=0.8, linewidth=0.8)
+    # Head outline + nose tick.
+    theta = np.linspace(0, 2 * np.pi, 256)
+    ax.plot(
+        center[0] + radius * np.cos(theta),
+        center[1] + radius * np.sin(theta),
+        color="black", linewidth=1.2,
+    )
+    nose_w, nose_h = radius * 0.08, radius * 0.10
+    ax.plot(
+        [center[0] - nose_w, center[0], center[0] + nose_w],
+        [center[1] + radius, center[1] + radius + nose_h, center[1] + radius],
+        color="black", linewidth=1.2,
+    )
 
-        ax.set_ylabel(f"l={l_deg}")
-        ax.legend(loc="upper right", fontsize=7, ncol=min(len(m_values), 5))
-        ax.grid(True, alpha=0.3)
+    # Channel lines (background, faint).
+    for s, d in zip(source_pos, detector_pos):
+        ax.plot([s[0], d[0]], [s[1], d[1]], color="0.85", linewidth=0.8, zorder=1)
 
-    axes[-1].set_xlabel("Time (samples)")
-    fig.suptitle("Spherical Harmonic Amplitudes over Time", fontsize=13)
+    # Source/detector dots with index labels in white.
+    ax.scatter(
+        src_unique[:, 0], src_unique[:, 1],
+        s=140, c="red", edgecolors="black", linewidths=0.5, zorder=3, label="source",
+    )
+    for i, (sx, sy) in zip(src_idx_unique, src_unique):
+        ax.text(sx, sy, str(int(i)), fontsize=6, color="white", fontweight="bold",
+                ha="center", va="center", zorder=4)
+    ax.scatter(
+        det_unique[:, 0], det_unique[:, 1],
+        s=140, c="royalblue", edgecolors="black", linewidths=0.5, zorder=3, label="detector",
+    )
+    for i, (dx, dy) in zip(det_idx_unique, det_unique):
+        ax.text(dx, dy, str(int(i)), fontsize=6, color="white", fontweight="bold",
+                ha="center", va="center", zorder=4)
+
+    # Channel midpoints, coloured by metric.
+    plot_values = np.log10(np.maximum(values, 1e-30)) if log_scale else values
+    sc = ax.scatter(
+        midpoints[:, 0], midpoints[:, 1],
+        s=220, c=plot_values, cmap=cmap,
+        edgecolors="black", linewidths=0.8, zorder=5,
+    )
+    if channel_labels is not None:
+        offset = radius * 0.025
+        for (mx, my), lbl in zip(midpoints, channel_labels):
+            ax.text(mx + offset, my + offset, str(lbl),
+                    fontsize=5, color="black", zorder=6, ha="left", va="bottom")
+
+    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(f"log10({metric_name})" if log_scale else metric_name, fontsize=9)
+    pad = radius * 0.15
+    ax.set_xlim(center[0] - radius - pad, center[0] + radius + pad)
+    ax.set_ylim(center[1] - radius - pad, center[1] + radius + pad)
+    ax.legend(loc="lower right", fontsize=8, frameon=False)
+    if title:
+        ax.set_title(title, fontsize=11)
     plt.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
-def _load_data_for_plot(data_path: Path, config: dict, short_pca_basis: Optional[np.ndarray] = None):
-    """Load (Y, time) honoring the chromophore filter recorded in config.
+def _contiguous_true_runs(mask_row: np.ndarray) -> list[tuple[int, int]]:
+    """Return list of (start, end) sample indices for each contiguous True run."""
+    mask = np.asarray(mask_row).astype(bool)
+    if not mask.any():
+        return []
+    diffs = np.diff(mask.astype(int))
+    starts = list(np.where(diffs == 1)[0] + 1)
+    ends = list(np.where(diffs == -1)[0] + 1)
+    if mask[0]:
+        starts.insert(0, 0)
+    if mask[-1]:
+        ends.append(len(mask))
+    return list(zip(starts, ends))
 
-    If config["_short_pca_basis"] (k, n_t) is set or short_pca_basis is passed,
-    regress those components out of Y to mirror what was done at fit time.
+
+def _posterior_predictive_samples(
+    sigma: np.ndarray,
+    noise_var: np.ndarray,
+    length_scale: float,
+    Y: np.ndarray,
+    n_samples: int,
+    seed: int = 0,
+    add_observation_noise: bool = True,
+) -> np.ndarray:
+    """Draw `n_samples` from p(y_new | Y) (or p(z | Y) if add_observation_noise=False)
+    under the Whittle separable GP model.
+
+    Math (per Whittle frequency bin k and signal eigenmode j):
+        prior:        z̃_kj ~ CN(0, T · S_k · λ_j)
+        likelihood:   W_kj | z̃_kj ~ CN(z̃_kj, T)
+        posterior:    z̃_kj | W_kj ~ CN(η_kj · W_kj, η_kj · T)
+    where η_kj = S_k λ_j / (S_k λ_j + 1) and λ_j are the eigenvalues of
+    M = D^{-½} Σ D^{-½}, D = diag(σ²). Real bins (k=0, k=T/2) get N instead of CN.
+    Transform back via D^½ U then irfft to reach the time domain. If
+    `add_observation_noise`, additionally add ε ~ N(0, diag(σ²)) per channel.
+
+    Returns array of shape (n_samples, N, T).
     """
-    if short_pca_basis is None:
-        short_pca_basis = config.get("_short_pca_basis", None)
-    from fnirs.io import load_hemodynamic_data, load_snirf_data, load_lob_data, ChromophoreType
+    rng = np.random.default_rng(seed)
+    N, T = Y.shape
 
-    chrom_str = config.get("chromophore", "hbo").lower()
-    suffix = Path(data_path).suffix
-    if suffix in (".snirf", ".lob"):
-        nirs_data = load_snirf_data(str(data_path)) if suffix == ".snirf" else load_lob_data(str(data_path))
-        label_map = {"hbo": "HbO", "hbr": "HbR", "hbt": "HbT"}
-        target_label = label_map.get(chrom_str)
-        if target_label is None:
-            raise ValueError(f"Unknown chromophore in config: {chrom_str!r}")
-        selected = nirs_data.get_channels_by_data_type_label(target_label)
-        if not selected:
-            available = sorted({ch.measurement_info.data_type_label for ch in nirs_data.channels})
-            raise ValueError(
-                f"No channels with data_type_label={target_label!r} in {data_path}. "
-                f"Available: {available}"
-            )
-        if not config.get("include_short_channels", False):
-            selected = [ch for ch in selected if not ch.is_short_separation]
-        ch_indices = np.array([ch.channel_idx for ch in selected])
-        Y = nirs_data.time_series[:, ch_indices].T
-        time = np.asarray(nirs_data.time)
-    else:
-        hemo_data = load_hemodynamic_data(str(data_path))
-        chrom_map = {"hbo": ChromophoreType.HbO, "hbr": ChromophoreType.HbR, "hbt": ChromophoreType.HbT}
-        chrom = chrom_map[chrom_str]
-        Y = hemo_data.get_concentration_matrix(chrom).T
-        time = np.asarray(hemo_data.time)
+    sqrt_d = np.sqrt(noise_var)
+    inv_sqrt_d = 1.0 / sqrt_d
+    M = inv_sqrt_d[:, None] * sigma * inv_sqrt_d[None, :]
+    M = 0.5 * (M + M.T) + 1e-8 * np.eye(N)
+    lam, U = np.linalg.eigh(M)
 
-    bp = config.get("bandpass")
-    if bp:
-        from fnirs.cli import _parse_bandpass, _apply_bandpass
-        low_hz, high_hz = _parse_bandpass(bp)
-        dt_plot = float(time[1] - time[0])
-        Y = _apply_bandpass(Y, dt_plot, low_hz, high_hz)
+    mean = Y.mean(axis=-1, keepdims=True)
+    Yk = np.fft.rfft(Y - mean, axis=-1)
+    F = Yk.shape[-1]
 
-    if short_pca_basis is not None and short_pca_basis.shape[1] == Y.shape[1]:
-        Y_c = Y - Y.mean(axis=1, keepdims=True)
-        beta = short_pca_basis @ Y_c.T  # (k, n_long)
-        Y = Y - beta.T @ short_pca_basis
+    freqs = np.fft.rfftfreq(T, d=1.0)
+    omega = 2 * np.pi * freqs
+    lam_kernel = np.sqrt(3.0) / float(length_scale)
+    psd = 4.0 * lam_kernel**3 / (lam_kernel**2 + omega**2) ** 2  # (F,)
 
-    if config.get("mav_scale", False):
-        mav = np.mean(np.abs(Y), axis=1, keepdims=True)
-        scale = np.where(mav > 0, mav, 1.0)
-        Y = Y / scale
+    Wk = U.T @ (inv_sqrt_d[:, None] * Yk)         # (N, F)
+    scaled_lam = psd[:, None] * lam[None, :]       # (F, N)
+    eta = scaled_lam / (scaled_lam + 1.0)          # (F, N), in [0, 1)
+    post_mean_eig = eta.T * Wk                     # (N, F)
+    post_std_eig = np.sqrt(eta.T * T)              # (N, F)
 
-    return Y, time
+    is_real = np.zeros(F, dtype=bool)
+    is_real[0] = True
+    if T % 2 == 0:
+        is_real[-1] = True
+
+    samples = np.empty((n_samples, N, T), dtype=np.float64)
+    for s in range(n_samples):
+        re = rng.standard_normal((N, F))
+        im = rng.standard_normal((N, F))
+        # CN(0, σ²) ⇒ each of re, im ~ N(0, σ²/2).
+        noise_eig = (post_std_eig / np.sqrt(2)) * (re + 1j * im)
+        for k_real in np.where(is_real)[0]:
+            noise_eig[:, k_real] = post_std_eig[:, k_real] * rng.standard_normal(N)
+        Z_eig = post_mean_eig + noise_eig
+        Z_freq = sqrt_d[:, None] * (U @ Z_eig)
+        z_t = np.fft.irfft(Z_freq, n=T, axis=-1)
+        if add_observation_noise:
+            z_t = z_t + sqrt_d[:, None] * rng.standard_normal((N, T))
+        samples[s] = z_t + mean
+
+    return samples
+
+
+def plot_connectivity(sigma: np.ndarray, output_path: Path):
+    vmax = float(np.max(np.abs(sigma)))
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(sigma, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    ax.set_xlabel("Channel")
+    ax.set_ylabel("Channel")
+    ax.set_title(r"Channel covariance $\Sigma$")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_correlation(correlation: np.ndarray, output_path: Path):
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(correlation, cmap="RdBu_r", vmin=-1.0, vmax=1.0)
+    ax.set_xlabel("Channel")
+    ax.set_ylabel("Channel")
+    ax.set_title("Channel correlation")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_noise_std(
+    noise_var: np.ndarray,
+    output_path: Path,
+    channel_labels: np.ndarray | None = None,
+):
+    noise_std = np.sqrt(np.asarray(noise_var))
+    n = len(noise_std)
+    width = max(10.0, 0.18 * n)
+    fig, ax = plt.subplots(figsize=(width, 4))
+    ax.bar(range(n), noise_std, color="coral", alpha=0.8)
+    labels = [str(c) for c in channel_labels] if channel_labels is not None else [str(i) for i in range(n)]
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_xlabel("Channel")
+    ax.set_ylabel("Noise std")
+    ax.set_title("Per-channel noise standard deviation")
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_loss_curve(losses: np.ndarray, output_path: Path):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(np.arange(1, len(losses) + 1), losses, marker="o", markersize=3)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Negative log-likelihood")
+    ax.set_title("Optimisation trace")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_channel_traces(
+    Y: np.ndarray,
+    posterior_mean: np.ndarray,
+    noise_var: np.ndarray,
+    dt: float,
+    output_path: Path,
+    channel_labels: np.ndarray | None = None,
+    n_cols: int = 4,
+    stim_onsets: np.ndarray | None = None,
+    stim_durations: np.ndarray | None = None,
+    sigma_matrix: np.ndarray | None = None,
+    length_scale: float | None = None,
+    n_posterior_samples: int = 20,
+    posterior_seed: int = 0,
+    chi2_red_per_channel: np.ndarray | None = None,
+    val_mask: np.ndarray | None = None,
+):
+    """Grid of small per-channel panels: data + posterior predictive draws.
+
+    If `sigma_matrix` and `length_scale` are provided, draws `n_posterior_samples`
+    samples from p(y_new | Y) and overlays each as a faint red line. Otherwise
+    falls back to a ±σ band around the posterior mean.
+    """
+    n_channels = Y.shape[0]
+    t = np.arange(Y.shape[1]) * dt
+    noise_std = np.sqrt(np.asarray(noise_var))
+
+    onsets = np.asarray(stim_onsets, dtype=float).ravel() if stim_onsets is not None else np.zeros(0)
+    durations = np.asarray(stim_durations, dtype=float).ravel() if stim_durations is not None else np.zeros(0)
+    if onsets.size != durations.size:
+        onsets = np.zeros(0)
+        durations = np.zeros(0)
+
+    # If a validation mask is provided, the model was fit on imputed Y (channel
+    # mean at masked positions). Sampling must use the same imputed Y so that
+    # the Wiener filter — and hence the saved posterior_mean — stay consistent.
+    Y_for_sampler = np.asarray(Y).copy()
+    if val_mask is not None:
+        vm = np.asarray(val_mask, dtype=bool)
+        for i in range(Y_for_sampler.shape[0]):
+            train_idx = ~vm[i]
+            if train_idx.any():
+                Y_for_sampler[i, vm[i]] = Y_for_sampler[i, train_idx].mean()
+
+    samples: np.ndarray | None = None
+    if sigma_matrix is not None and length_scale is not None and n_posterior_samples > 0:
+        samples = _posterior_predictive_samples(
+            np.asarray(sigma_matrix), np.asarray(noise_var), float(length_scale),
+            Y_for_sampler, int(n_posterior_samples), seed=int(posterior_seed),
+            add_observation_noise=True,
+        )
+
+    n_cols = max(1, int(n_cols))
+    n_rows = int(np.ceil(n_channels / n_cols))
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(3.5 * n_cols, max(1.6, 0.9 * n_rows)),
+        sharex=True,
+        squeeze=False,
+    )
+    axes_flat = axes.ravel()
+
+    for i in range(n_channels):
+        ax = axes_flat[i]
+        for o, d in zip(onsets, durations):
+            ax.axvspan(o, o + d, color="0.6", alpha=0.25, linewidth=0, zorder=0)
+        if val_mask is not None:
+            for s_idx, e_idx in _contiguous_true_runs(val_mask[i]):
+                ax.axvspan(s_idx * dt, e_idx * dt, color="gold", alpha=0.25, linewidth=0, zorder=0)
+        z = posterior_mean[i]
+        if samples is not None:
+            for s in range(samples.shape[0]):
+                ax.plot(t, samples[s, i], color="red", alpha=0.12, linewidth=0.4, zorder=1)
+        else:
+            ax.fill_between(t, z - noise_std[i], z + noise_std[i], color="red", alpha=0.18, linewidth=0, zorder=1)
+        ax.plot(t, z, color="red", linestyle="--", linewidth=0.8, label=r"$E[z\mid Y]$", zorder=2)
+        ax.plot(t, Y[i], color="black", alpha=0.95, linewidth=0.5, label="Y", zorder=3)
+        label = str(channel_labels[i]) if channel_labels is not None else f"ch {i}"
+        if chi2_red_per_channel is not None:
+            label = f"{label}   χ²ᵣ={float(chi2_red_per_channel[i]):.3f}"
+        ax.set_title(label, fontsize=8, pad=2)
+        ax.grid(True, alpha=0.25)
+        ax.tick_params(axis="both", labelsize=6)
+
+    for j in range(n_channels, n_rows * n_cols):
+        axes_flat[j].set_visible(False)
+
+    # Single legend on the first axis; xlabels only on the bottom-most visible panel of each column.
+    axes_flat[0].legend(loc="upper right", fontsize=6, ncol=2)
+    for col in range(n_cols):
+        last_idx_in_col = max((i for i in range(col, n_channels, n_cols)), default=None)
+        if last_idx_in_col is not None:
+            axes[last_idx_in_col // n_cols, col].set_xlabel("Time (s)", fontsize=8)
+
+    title = (
+        r"Data (black) vs posterior predictive draws (red, low alpha) and $E[z\mid Y]$ (dashed)"
+        if samples is not None
+        else r"Raw vs Wiener-filtered channel traces (band: $E[z\mid Y]\pm\sigma_i$)"
+    )
+    fig.suptitle(title, fontsize=11)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_latent_draws(
+    Y: np.ndarray,
+    posterior_mean: np.ndarray,
+    sigma_matrix: np.ndarray,
+    noise_var: np.ndarray,
+    length_scale: float,
+    dt: float,
+    output_path: Path,
+    channel_labels: np.ndarray | None = None,
+    n_cols: int = 4,
+    stim_onsets: np.ndarray | None = None,
+    stim_durations: np.ndarray | None = None,
+    n_samples: int = 30,
+    seed: int = 0,
+    chi2_red_per_channel: np.ndarray | None = None,
+    val_mask: np.ndarray | None = None,
+):
+    """Latent posterior draws p(z | Y) with the observed data on top.
+
+    Each blue line is one sample of the latent signal z conditioned on the
+    observations; their spread shows the posterior uncertainty in the GP. The
+    black line is Y. No observation noise is added to the draws (use
+    plot_channel_traces for that).
+    """
+    n_channels = Y.shape[0]
+    t = np.arange(Y.shape[1]) * dt
+
+    onsets = np.asarray(stim_onsets, dtype=float).ravel() if stim_onsets is not None else np.zeros(0)
+    durations = np.asarray(stim_durations, dtype=float).ravel() if stim_durations is not None else np.zeros(0)
+    if onsets.size != durations.size:
+        onsets = np.zeros(0)
+        durations = np.zeros(0)
+
+    # Reconstruct imputed Y if a mask is given, so draws line up with the
+    # saved posterior_mean (the model never saw the masked timepoints).
+    Y_for_sampler = np.asarray(Y).copy()
+    if val_mask is not None:
+        vm = np.asarray(val_mask, dtype=bool)
+        for i in range(Y_for_sampler.shape[0]):
+            train_idx = ~vm[i]
+            if train_idx.any():
+                Y_for_sampler[i, vm[i]] = Y_for_sampler[i, train_idx].mean()
+
+    samples = _posterior_predictive_samples(
+        np.asarray(sigma_matrix), np.asarray(noise_var), float(length_scale),
+        Y_for_sampler, int(n_samples), seed=int(seed),
+        add_observation_noise=False,
+    )
+
+    n_cols = max(1, int(n_cols))
+    n_rows = int(np.ceil(n_channels / n_cols))
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(3.5 * n_cols, max(1.6, 0.9 * n_rows)),
+        sharex=True,
+        squeeze=False,
+    )
+    axes_flat = axes.ravel()
+
+    for i in range(n_channels):
+        ax = axes_flat[i]
+        for o, d in zip(onsets, durations):
+            ax.axvspan(o, o + d, color="0.6", alpha=0.25, linewidth=0, zorder=0)
+        if val_mask is not None:
+            for s_idx, e_idx in _contiguous_true_runs(val_mask[i]):
+                ax.axvspan(s_idx * dt, e_idx * dt, color="gold", alpha=0.25, linewidth=0, zorder=0)
+        for s in range(samples.shape[0]):
+            ax.plot(t, samples[s, i], color="steelblue", alpha=0.12, linewidth=0.4, zorder=1)
+        ax.plot(t, posterior_mean[i], color="steelblue", linewidth=0.8, alpha=0.9,
+                label=r"$E[z\mid Y]$", zorder=2)
+        ax.plot(t, Y[i], color="black", alpha=0.95, linewidth=0.5, label="Y", zorder=3)
+        label = str(channel_labels[i]) if channel_labels is not None else f"ch {i}"
+        if chi2_red_per_channel is not None:
+            label = f"{label}   χ²ᵣ={float(chi2_red_per_channel[i]):.3f}"
+        ax.set_title(label, fontsize=8, pad=2)
+        ax.grid(True, alpha=0.25)
+        ax.tick_params(axis="both", labelsize=6)
+
+    for j in range(n_channels, n_rows * n_cols):
+        axes_flat[j].set_visible(False)
+
+    axes_flat[0].legend(loc="upper right", fontsize=6, ncol=2)
+    for col in range(n_cols):
+        last_idx_in_col = max((i for i in range(col, n_channels, n_cols)), default=None)
+        if last_idx_in_col is not None:
+            axes[last_idx_in_col // n_cols, col].set_xlabel("Time (s)", fontsize=8)
+
+    fig.suptitle(r"Latent posterior draws $z \sim p(z\mid Y)$ (blue) with data (black)", fontsize=11)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_residuals(
-    X_freq: np.ndarray,
-    ST: np.ndarray,
-    n_timepoints: int,
-    data_path: Path,
-    config: dict,
+    Y: np.ndarray,
+    posterior_mean: np.ndarray,
     output_path: Path,
+    channel_labels: np.ndarray | None = None,
+    val_mask: np.ndarray | None = None,
+    noise_std: np.ndarray | None = None,
 ):
-    """Plot per-channel residual RMS."""
-    Y, _ = _load_data_for_plot(data_path, config)
+    """Per-channel RMS of Y − E[z|Y]. If val_mask is given, plot train and val
+    residuals as paired bars; otherwise plot a single bar per channel."""
+    residuals = Y - posterior_mean
+    n = Y.shape[0]
+    width = max(10.0, 0.22 * n)
+    fig, ax = plt.subplots(figsize=(width, 4.5))
+    labels = [str(c) for c in channel_labels] if channel_labels is not None else [str(i) for i in range(n)]
+    x = np.arange(n)
 
-    # Predict
-    pred_freq = ST @ X_freq
-    Y_hat = np.fft.irfft(pred_freq, n=n_timepoints, axis=1)
+    if val_mask is not None:
+        vm = np.asarray(val_mask, dtype=bool)
+        train_rms = np.array([
+            np.sqrt(np.mean(residuals[i, ~vm[i]] ** 2)) if (~vm[i]).any() else 0.0
+            for i in range(n)
+        ])
+        val_rms = np.array([
+            np.sqrt(np.mean(residuals[i, vm[i]] ** 2)) if vm[i].any() else 0.0
+            for i in range(n)
+        ])
+        bar_w = 0.4
+        ax.bar(x - bar_w/2, train_rms, bar_w, color="steelblue", alpha=0.85, label="train (in-sample)")
+        ax.bar(x + bar_w/2, val_rms, bar_w, color="goldenrod", alpha=0.85, label="val (held-out)")
+    else:
+        rms = np.sqrt(np.mean(residuals ** 2, axis=1))
+        ax.bar(x, rms, 0.8, color="steelblue", alpha=0.85, label="residual")
 
-    # Residuals
-    residuals = Y[:, :n_timepoints] - Y_hat
-    rms = np.sqrt(np.mean(residuals ** 2, axis=1))
+    if noise_std is not None:
+        sigma_med = float(np.median(np.asarray(noise_std)))
+        ax.axhline(sigma_med, color="black", linestyle="--", linewidth=0.8,
+                   label=f"σ (median) = {sigma_med:.2f}")
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.bar(range(len(rms)), rms, color="steelblue", alpha=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax.set_xlim(-0.5, n - 0.5)
     ax.set_xlabel("Channel")
     ax.set_ylabel("Residual RMS")
-    ax.set_title("Per-Channel Residual RMS")
+    ax.set_title("Per-channel residual RMS  (Y − E[z|Y])")
     ax.grid(True, alpha=0.3, axis="y")
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_data_vs_fit(
-    X_freq: np.ndarray,
-    ST: np.ndarray,
-    n_timepoints: int,
-    data_path: Path,
-    config: dict,
-    output_path: Path,
-    noise_variance: Optional[np.ndarray] = None,
-    max_channels: Optional[int] = None,
-):
-    """Plot per-channel data signal vs model fit, with optional ±σ noise band."""
-    Y, time = _load_data_for_plot(data_path, config)
-
-    pred_freq = ST @ X_freq
-    Y_hat = np.fft.irfft(pred_freq, n=n_timepoints, axis=1)
-
-    Y = Y[:, :n_timepoints]
-    time = time[:n_timepoints]
-
-    n_channels = Y.shape[0]
-    if max_channels is not None and n_channels > max_channels:
-        channel_indices = np.linspace(0, n_channels - 1, max_channels, dtype=int)
-    else:
-        channel_indices = np.arange(n_channels)
-
-    n_show = len(channel_indices)
-    n_cols = int(np.ceil(np.sqrt(n_show)))
-    n_rows = int(np.ceil(n_show / n_cols))
-
-    fig, axes = plt.subplots(
-        n_rows, n_cols,
-        figsize=(3.2 * n_cols, 1.8 * n_rows),
-        sharex=True, squeeze=False,
-    )
-
-    sigma = np.sqrt(noise_variance) if noise_variance is not None else None
-    mse_per_ch = np.mean((Y - Y_hat) ** 2, axis=1)
-    var_per_ch = np.var(Y, axis=1)
-
-    for ax_idx, ch in enumerate(channel_indices):
-        ax = axes[ax_idx // n_cols, ax_idx % n_cols]
-        ax.plot(time, Y[ch], color="black", linewidth=0.8, alpha=0.9, label="data", zorder=1)
-        if sigma is not None:
-            ax.fill_between(
-                time,
-                Y_hat[ch] - sigma[ch],
-                Y_hat[ch] + sigma[ch],
-                color="C3", alpha=0.2, linewidth=0, label="±σ", zorder=2,
-            )
-        ax.plot(time, Y_hat[ch], color="C3", linewidth=1.0, linestyle="--", label="fit", zorder=3)
-        r2 = 1.0 - mse_per_ch[ch] / var_per_ch[ch] if var_per_ch[ch] > 0 else float("nan")
-        ax.set_title(f"ch {ch}: MSE={mse_per_ch[ch]:.2e}, R²={r2:.2f}", fontsize=7)
-        ax.tick_params(labelsize=7)
-        ax.grid(True, alpha=0.3)
-
-    for ax_idx in range(n_show, n_rows * n_cols):
-        axes[ax_idx // n_cols, ax_idx % n_cols].axis("off")
-
-    axes[0, 0].legend(loc="upper right", fontsize=7)
-    fig.supxlabel("Time", fontsize=10)
-    fig.supylabel("Signal", fontsize=10)
-    fig.suptitle("Data vs Model Fit", fontsize=13)
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_short_channel_pca(
-    Y_short: np.ndarray,
-    V_top: np.ndarray,
-    time: np.ndarray,
-    output_path: Path,
-):
-    """Three-panel diagnostic for short-channel PCA regression:
-    raw short-channel signals, the top-k eigenvector time courses, and the
-    short-channel residuals after removing those k components.
-    """
-    n_short = Y_short.shape[0]
-    k = V_top.shape[0]
-
-    Y_short_c = Y_short - Y_short.mean(axis=1, keepdims=True)
-    beta = V_top @ Y_short_c.T  # (k, n_short)
-    Y_short_resid = Y_short - beta.T @ V_top
-
-    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-
-    for c in range(n_short):
-        axes[0].plot(time, Y_short[c], linewidth=0.7, alpha=0.8, label=f"sh{c}")
-    axes[0].set_ylabel("Signal")
-    axes[0].set_title(f"Short channel data ({n_short} channels)")
-    axes[0].grid(True, alpha=0.3)
-    if n_short <= 20:
-        axes[0].legend(loc="upper right", fontsize=7, ncol=min(n_short, 5))
-
-    cmap = plt.cm.viridis
-    for j in range(k):
-        axes[1].plot(time, V_top[j], color=cmap(j / max(k - 1, 1)),
-                     linewidth=1.0, label=f"PC{j+1}")
-    axes[1].set_ylabel("Component")
-    axes[1].set_title(f"Top {k} PCA eigenvectors of centered short data")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend(loc="upper right", fontsize=8, ncol=min(k, 6))
-
-    for c in range(n_short):
-        axes[2].plot(time, Y_short_resid[c], linewidth=0.7, alpha=0.8)
-    axes[2].set_xlabel("Time")
-    axes[2].set_ylabel("Residual")
-    axes[2].set_title(f"Short channel residuals after removing top-{k} components")
-    axes[2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_correlation_matrix(
-    X_freq: np.ndarray,
-    ST: np.ndarray,
-    n_timepoints: int,
-    data_path: Path,
-    config: dict,
-    output_path: Path,
-):
-    """Plot channel-channel correlation matrices for data, model fit, and residual."""
-    Y, _ = _load_data_for_plot(data_path, config)
-    Y = Y[:, :n_timepoints]
-
-    Y_hat = np.fft.irfft(ST @ X_freq, n=n_timepoints, axis=1)
-    R = Y - Y_hat
-
-    def _corr(M):
-        Mc = M - M.mean(axis=1, keepdims=True)
-        std = Mc.std(axis=1, keepdims=True)
-        std[std == 0] = 1.0
-        Mn = Mc / std
-        return (Mn @ Mn.T) / Mn.shape[1]
-
-    C_data = _corr(Y)
-    C_fit = _corr(Y_hat)
-    C_res = _corr(R)
-    n = Y.shape[0]
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    for ax, C, title in zip(axes, [C_data, C_fit, C_res], ["Data", "Fit", "Residual"]):
-        im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
-        ax.set_title(f"{title} (n={n})")
-        ax.set_xlabel("channel")
-    axes[0].set_ylabel("channel")
-    fig.colorbar(im, ax=axes, fraction=0.025, pad=0.04, label="corr")
-    fig.suptitle("Channel-Channel Correlation", fontsize=13)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_noise_variance_history(
-    noise_variance_history: np.ndarray,
-    output_path: Path,
-):
-    """Plot per-channel σ across IRLS iterations.
-
-    noise_variance_history has shape (n_iter+1, n_channels). Index 0 is the
-    OLS-init; subsequent rows are after each IRLS iteration.
-    """
-    sigma = np.sqrt(np.maximum(noise_variance_history, 0))
-    n_steps, n_channels = sigma.shape
-    iters = np.arange(n_steps)
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Linear scale
-    ax = axes[0]
-    cmap = plt.cm.viridis
-    for c in range(n_channels):
-        ax.plot(iters, sigma[:, c], color=cmap(c / max(n_channels - 1, 1)),
-                linewidth=0.6, alpha=0.7)
-    ax.set_xlabel("IRLS iteration (0 = OLS init)")
-    ax.set_ylabel("σ (per channel)")
-    ax.set_title("Per-channel σ across IRLS iterations (linear)")
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(iters)
-
-    # Log scale — easier to see runaway
-    ax = axes[1]
-    sigma_pos = np.where(sigma > 0, sigma, np.nan)
-    for c in range(n_channels):
-        ax.plot(iters, sigma_pos[:, c], color=cmap(c / max(n_channels - 1, 1)),
-                linewidth=0.6, alpha=0.7)
-    ax.set_yscale("log")
-    ax.set_xlabel("IRLS iteration (0 = OLS init)")
-    ax.set_ylabel("σ (per channel, log)")
-    ax.set_title("Per-channel σ across IRLS iterations (log)")
-    ax.grid(True, alpha=0.3, which="both")
-    ax.set_xticks(iters)
-
-    fig.suptitle(f"IRLS noise σ trajectory ({n_channels} channels, {n_steps - 1} iterations)", fontsize=13)
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_noise_variance(
-    noise_variance: np.ndarray,
-    output_path: Path,
-):
-    """Plot per-channel estimated noise variance (IRLS)."""
-    n = len(noise_variance)
-    fig, ax = plt.subplots(figsize=(max(10, 0.18 * n), 4))
-    ax.bar(range(n), noise_variance, color="coral", alpha=0.8)
-    ax.set_xlabel("Channel")
-    ax.set_ylabel("Noise Variance")
-    ax.set_title("Per-Channel Estimated Noise Variance (IRLS)")
-    ax.set_xticks(range(n))
-    ax.set_xticklabels([str(i) for i in range(n)], rotation=90, fontsize=6)
-    ax.set_xlim(-0.5, n - 0.5)
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.legend(loc="upper right", fontsize=8)
     plt.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
 def plot_power_spectrum(
-    X_freq: np.ndarray,
-    ST: np.ndarray,
-    n_timepoints: int,
-    data_path: Path,
-    config: dict,
+    Y: np.ndarray,
+    posterior_mean: np.ndarray,
+    dt: float,
     output_path: Path,
 ):
-    """Plot average power spectrum of data vs model prediction."""
-    Y, _ = _load_data_for_plot(data_path, config)
-
-    # Data power spectrum
-    Y_freq_data = np.fft.rfft(Y, axis=1)
-    data_power = np.mean(np.abs(Y_freq_data) ** 2, axis=0)
-
-    # Model power spectrum
-    pred_freq = ST @ X_freq
-    model_power = np.mean(np.abs(pred_freq) ** 2, axis=0)
-
-    freqs = np.fft.rfftfreq(Y.shape[1])
+    T = Y.shape[1]
+    freqs = np.fft.rfftfreq(T, d=dt)
+    Y_pow = np.mean(np.abs(np.fft.rfft(Y, axis=1)) ** 2, axis=0)
+    Z_pow = np.mean(np.abs(np.fft.rfft(posterior_mean, axis=1)) ** 2, axis=0)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.semilogy(freqs, data_power, label="Data", alpha=0.7, linewidth=0.8)
-    ax.semilogy(freqs[:len(model_power)], model_power, label="Model", alpha=0.7, linewidth=0.8)
-    ax.set_xlabel("Frequency (cycles/sample)")
+    ax.loglog(freqs[1:], Y_pow[1:], label="Data", alpha=0.7, linewidth=0.9)
+    ax.loglog(freqs[1:], Z_pow[1:], label="E[z|Y]", alpha=0.9, linewidth=0.9)
+    ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Power")
-    ax.set_title("Average Power Spectrum: Data vs Model")
+    ax.set_title("Average power spectrum: data vs latent")
     ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_spatial_snapshot(
-    X_freq: np.ndarray,
-    terms: List[Tuple[int, int]],
-    n_timepoints: int,
-    config: dict,
-    output_path: Path,
-    n_snapshots: int = 4,
-):
-    """Plot spatial field on sphere at selected time points."""
-    from scipy.special import sph_harm_y
-
-    # Reconstruct time-domain coefficients for each harmonic
-    # X_time[i, t] = amplitude of harmonic i at time t
-    X_time = np.fft.irfft(X_freq, n=n_timepoints, axis=1)
-
-    # Create grid of (theta, phi) points
-    n_grid = 30
-    theta_grid = np.linspace(0.1, np.pi - 0.1, n_grid)
-    phi_grid = np.linspace(0, 2 * np.pi, n_grid)
-    theta_mesh, phi_mesh = np.meshgrid(theta_grid, phi_grid)
-    theta_flat = theta_mesh.flatten()
-    phi_flat = phi_mesh.flatten()
-
-    # Build basis at grid points
-    n_spatial = len(terms)
-    ST_grid = np.zeros((len(theta_flat), n_spatial))
-    for i, (l, m) in enumerate(terms):
-        Y_val = sph_harm_y(l, m, phi_flat, theta_flat)
-        if m == 0:
-            ST_grid[:, i] = Y_val.real
-        elif m > 0:
-            ST_grid[:, i] = np.sqrt(2) * (-1) ** m * Y_val.real
-        else:
-            ST_grid[:, i] = np.sqrt(2) * (-1) ** m * Y_val.imag
-
-    # Select time points
-    time_indices = np.linspace(0, n_timepoints - 1, n_snapshots, dtype=int)
-
-    fig, axes = plt.subplots(1, n_snapshots, figsize=(4 * n_snapshots, 3.5),
-                             subplot_kw={"projection": "mollweide"})
-    if n_snapshots == 1:
-        axes = [axes]
-
-    for ax, t_idx in zip(axes, time_indices):
-        coeffs = X_time[:, t_idx]
-        field = ST_grid @ coeffs
-        field_2d = field.reshape(theta_mesh.shape)
-
-        # Mollweide projection expects lon in [-pi, pi], lat in [-pi/2, pi/2]
-        lon = phi_mesh - np.pi
-        lat = np.pi / 2 - theta_mesh
-
-        vmax = np.max(np.abs(field_2d))
-        im = ax.pcolormesh(lon, lat, field_2d, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
-        ax.set_title(f"t={t_idx}", fontsize=10)
-        ax.grid(True, alpha=0.3)
-
-    fig.colorbar(im, ax=axes, orientation="horizontal", fraction=0.05, pad=0.08)
-    fig.suptitle("Spatial Field Snapshots", fontsize=13)
+    ax.grid(True, alpha=0.3, which="both")
     plt.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
